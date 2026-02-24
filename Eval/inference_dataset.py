@@ -63,6 +63,10 @@ class InferenceDataset(Dataset):
         if img_path_str is None:
             raise KeyError(f"'meta.image_path' missing in {json_path}")
 
+        # Fix incorrect relative path: ../dataset/... should be ../../../...
+        if img_path_str.startswith('../dataset/'):
+            img_path_str = img_path_str.replace('../dataset/', '../../../', 1)
+
         img_path = (json_path.parent / img_path_str).resolve()
         if not img_path.exists():
             img_path = (self.data_dir / img_path_str).resolve()
@@ -285,15 +289,18 @@ def load_camera_from_first_frame(dataset_dir: Path) -> Tuple[np.ndarray, Tuple[i
     if "meta" not in data or "K" not in data["meta"]:
         raise KeyError(f"'meta.K' not found in {first_json}")
 
-    K = np.array(data["objects"]["meta"]["K"], dtype=np.float32)
+    K = np.array(data["meta"]["K"], dtype=np.float32)
 
     # Determine raw resolution by opening the referenced image
     img_path_str = data["meta"].get("image_path", None)
     if img_path_str is None:
         raise KeyError(f"'meta.image_path' not found in {first_json} (needed to get resolution)")
 
+    # Fix incorrect relative path: ../dataset/... should be ../../../...
+    if img_path_str.startswith('../dataset/'):
+        img_path_str = img_path_str.replace('../dataset/', '../../../', 1)
+
     # Resolve image path relative to the json file location
-    # (meta.image_path is often relative, like '../dataset/.../000000.rgb.jpg')
     img_path = (first_json.parent / img_path_str).resolve()
     if not img_path.exists():
         # fallback: try resolving relative to dataset_dir
@@ -317,28 +324,45 @@ def run_inference(args):
     print(f"Camera intrinsics:\n{camera_K}")
     print(f"Raw resolution: {raw_resolution}")
 
-    # Try to load keypoint names from config, otherwise use Panda default
+    # Load training config from checkpoint directory
+    checkpoint_dir = Path(args.model_path).parent
+    config_path = checkpoint_dir / 'config.yaml'
+
+    # Defaults
     keypoint_names = [
         'panda_link0', 'panda_link2', 'panda_link3',
         'panda_link4', 'panda_link6', 'panda_link7', 'panda_hand'
     ]
+    train_config = {}
 
-    # Load config to get actual keypoint configuration
-    checkpoint_dir = Path(args.model_path).parent
-    config_path = checkpoint_dir / 'config.yaml'
     if config_path.exists():
         import yaml
         with open(config_path, 'r') as f:
             train_config = yaml.safe_load(f)
         if 'keypoint_names' in train_config:
             keypoint_names = train_config['keypoint_names']
-            print(f"Loaded {len(keypoint_names)} keypoint names from config: {keypoint_names}")
+        print(f"Loaded training config from {config_path}")
+        print(f"  model_name: {train_config.get('model_name', 'N/A')}")
+        print(f"  keypoint_names ({len(keypoint_names)}): {keypoint_names}")
+    else:
+        print(f"Warning: Config not found at {config_path}, using defaults")
+
+    # Resolve config values (CLI args override config.yaml)
+    model_name = args.model_name or train_config.get('model_name', 'facebook/dinov2-base')
+    image_size = args.image_size or int(train_config.get('image_size', 512))
+    heatmap_size = args.heatmap_size or int(train_config.get('heatmap_size', 512))
+    use_cnn_stem = train_config.get('use_cnn_stem', True)
+    use_robot_classifier = train_config.get('use_robot_classifier', False)
+
+    print(f"  model_name: {model_name}")
+    print(f"  image_size: {image_size}, heatmap_size: {heatmap_size}")
+    print(f"  use_cnn_stem: {use_cnn_stem}, use_robot_classifier: {use_robot_classifier}")
 
     # Create dataset
     dataset = InferenceDataset(
         data_dir=args.dataset_dir,
         keypoint_names=keypoint_names,
-        image_size=(args.image_size, args.image_size)
+        image_size=(image_size, image_size)
     )
 
     dataloader = DataLoader(
@@ -353,24 +377,9 @@ def run_inference(args):
     print(f"\nLoading model from {args.model_path}")
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    # Try to load config from checkpoint directory to match training settings
-    checkpoint_dir = Path(args.model_path).parent
-    config_path = checkpoint_dir / 'config.yaml'
-
-    use_cnn_stem = True  # Default
-    use_robot_classifier = False  # Default
-
-    if config_path.exists():
-        import yaml
-        with open(config_path, 'r') as f:
-            train_config = yaml.safe_load(f)
-        use_cnn_stem = train_config.get('use_cnn_stem', True)
-        use_robot_classifier = train_config.get('use_robot_classifier', False)
-        print(f"Loaded training config: use_cnn_stem={use_cnn_stem}, use_robot_classifier={use_robot_classifier}")
-
     model = DINOv3PoseEstimator(
-        dino_model_name=args.model_name,
-        heatmap_size=(args.heatmap_size, args.heatmap_size),
+        dino_model_name=model_name,
+        heatmap_size=(heatmap_size, heatmap_size),
         unfreeze_blocks=0,  # Not needed for inference
         use_cnn_stem=use_cnn_stem,
         use_robot_classifier=use_robot_classifier
@@ -422,8 +431,8 @@ def run_inference(args):
         pred_keypoints = get_keypoints_from_heatmaps(pred_heatmaps)
 
         # Scale to raw resolution
-        scale_x = raw_resolution[0] / args.heatmap_size
-        scale_y = raw_resolution[1] / args.heatmap_size
+        scale_x = raw_resolution[0] / heatmap_size
+        scale_y = raw_resolution[1] / heatmap_size
 
         for i in range(len(pred_keypoints)):
             # Scale predictions to raw resolution
@@ -552,12 +561,12 @@ def main():
     # Model
     parser.add_argument('--model-path', type=str, required=True,
                         help='Path to trained model checkpoint')
-    parser.add_argument('--model-name', type=str, default='facebook/dinov2-base',
-                        help='DINOv3 model name')
-    parser.add_argument('--image-size', type=int, default=512,
-                        help='Input image size')
-    parser.add_argument('--heatmap-size', type=int, default=512,
-                        help='Output heatmap size')
+    parser.add_argument('--model-name', type=str, default=None,
+                        help='DINOv3 model name (auto-read from config.yaml if not specified)')
+    parser.add_argument('--image-size', type=int, default=None,
+                        help='Input image size (auto-read from config.yaml if not specified)')
+    parser.add_argument('--heatmap-size', type=int, default=None,
+                        help='Output heatmap size (auto-read from config.yaml if not specified)')
 
     # Dataset
     parser.add_argument('--dataset-dir', type=str, required=True,

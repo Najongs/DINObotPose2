@@ -8,7 +8,7 @@
 # =============================================================================
 
 # Data paths (REQUIRED - Update these paths!)
-DATA_DIR="/home/najo/NAS/DIP/2025_ICRA_Multi_View_Robot_Pose_Estimation/dataset/Converted_dataset/DREAM_to_DREAM/panda-3cam_azure"  # Training data directory
+DATA_DIR="/data/public/NAS/DINObotPose2/Dataset/Converted_dataset/DREAM_to_DREAM_syn"  # Training data directory
 TRAIN_SPLIT=0.9  # Train/Val split ratio (0.9 = 90% train, 10% val)
 
 # Model configuration
@@ -17,7 +17,7 @@ IMAGE_SIZE=512
 HEATMAP_SIZE=512
 UNFREEZE_BLOCKS=2  # Number of backbone blocks to unfreeze for fine-tuning
 
-USE_CNN_STEM=True
+USE_CNN_STEM=False  # Disabled for sim-to-real: CNN stem overfits to synthetic textures
 USE_ROBOT_CLASSIFIER=False  # Enable robot type classification (4 classes)
 
 # Training hyperparameters
@@ -32,13 +32,13 @@ SCHEDULER="cosine"  # Options: step, cosine, plateau, none
 
 # Loss weights
 HEATMAP_WEIGHT=1.0
-KP3D_WEIGHT=1000.0
+KP3D_WEIGHT=1.0
 ROBOT_CLASS_WEIGHT=1.0
 
 # Output and logging
 OUTPUT_DIR="./outputs/dinov3_base_$(date +%Y%m%d_%H%M%S)"
 WANDB_PROJECT="dinov3-pose-estimation"
-WANDB_RUN_NAME="dinov2-base-cosine"
+WANDB_RUN_NAME="dinov3_base_$(date +%Y%m%d_%H%M%S)"
 
 # Other settings
 SEED=42
@@ -55,8 +55,8 @@ RESUME=""  # Path to checkpoint for resuming (leave empty for new training)
 
 # --- Multi-GPU Training (Distributed Data Parallel) ---
 TRAIN_MODE="multi_gpu"
-NUM_GPUS=5  # 사용할 GPU 개수 (single GPU는 1로 설정)
-GPU_IDS="0,1,2,3,4"  # 사용할 GPU ID (예: "0,1,2,3")
+NUM_GPUS=3  # 사용할 GPU 개수 (single GPU는 1로 설정)
+GPU_IDS="0,1,2"  # 사용할 GPU ID (예: "0,1,2,3")
 
 # =============================================================================
 # Execute Training

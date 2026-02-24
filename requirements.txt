@@ -1,0 +1,17 @@
+ftfy
+omegaconf
+regex
+scikit-learn
+submitit
+termcolor
+torch
+torchmetrics
+torchvision
+tqdm
+wandb
+transformers
+albumentations
+matplotlib
+ruamel.yaml
+pyrr
+webcolors

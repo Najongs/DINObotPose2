@@ -219,41 +219,46 @@ def inference_single_image(args):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
 
-    # Keypoint names (Panda robot default)
+    # Load training config from checkpoint directory
+    checkpoint_dir = Path(args.model_path).parent
+    config_path = checkpoint_dir / 'config.yaml'
+
+    # Defaults
     keypoint_names = [
         'panda_link0', 'panda_link2', 'panda_link3',
         'panda_link4', 'panda_link6', 'panda_link7', 'panda_hand'
     ]
-
-    # Load model
-    print(f"\nLoading model from {args.model_path}")
-
-    # Try to load config from checkpoint directory to match training settings
-    checkpoint_dir = Path(args.model_path).parent
-    config_path = checkpoint_dir / 'config.yaml'
-
-    use_cnn_stem = True  # Default
-    use_robot_classifier = False  # Default
+    train_config = {}
 
     if config_path.exists():
         import yaml
         with open(config_path, 'r') as f:
             train_config = yaml.safe_load(f)
-        use_cnn_stem = train_config.get('use_cnn_stem', True)
-        use_robot_classifier = train_config.get('use_robot_classifier', False)
-
-        print(f"Loaded training config:")
-        print(f"  use_cnn_stem={use_cnn_stem}")
-        print(f"  use_robot_classifier={use_robot_classifier}")
+        if 'keypoint_names' in train_config:
+            keypoint_names = train_config['keypoint_names']
+        print(f"Loaded training config from {config_path}")
     else:
         print(f"Warning: Config not found at {config_path}, using defaults")
+
+    # Use config values, with CLI args as overrides
+    model_name = args.model_name or train_config.get('model_name', 'facebook/dinov2-base')
+    image_size = args.image_size or int(train_config.get('image_size', 512))
+    heatmap_size = args.heatmap_size or int(train_config.get('heatmap_size', 512))
+    use_cnn_stem = train_config.get('use_cnn_stem', True)
+    use_robot_classifier = train_config.get('use_robot_classifier', False)
+
+    print(f"\nLoading model from {args.model_path}")
+    print(f"  model_name: {model_name}")
+    print(f"  image_size: {image_size}, heatmap_size: {heatmap_size}")
+    print(f"  use_cnn_stem: {use_cnn_stem}, use_robot_classifier: {use_robot_classifier}")
+    print(f"  keypoint_names ({len(keypoint_names)}): {keypoint_names}")
 
     # Skeleton connections (build dynamically based on number of keypoints)
     skeleton = [(i, i+1) for i in range(len(keypoint_names)-1)]
 
     model = DINOv3PoseEstimator(
-        dino_model_name=args.model_name,
-        heatmap_size=(args.heatmap_size, args.heatmap_size),
+        dino_model_name=model_name,
+        heatmap_size=(heatmap_size, heatmap_size),
         unfreeze_blocks=0,
         use_cnn_stem=use_cnn_stem,
         use_robot_classifier=use_robot_classifier
@@ -293,7 +298,7 @@ def inference_single_image(args):
 
     # Image preprocessing
     transform = transforms.Compose([
-        transforms.Resize((args.image_size, args.image_size)),
+        transforms.Resize((image_size, image_size)),
         transforms.ToTensor(),
         transforms.Normalize(
             mean=[0.485, 0.456, 0.406],
@@ -326,8 +331,8 @@ def inference_single_image(args):
     pred_keypoints = get_keypoints_from_heatmaps(pred_heatmaps)[0]  # (N, 2)
 
     # Scale keypoints to original image size
-    scale_x = original_size[0] / args.heatmap_size
-    scale_y = original_size[1] / args.heatmap_size
+    scale_x = original_size[0] / heatmap_size
+    scale_y = original_size[1] / heatmap_size
 
     pred_keypoints_scaled = pred_keypoints.copy()
     pred_keypoints_scaled[:, 0] *= scale_x
@@ -473,13 +478,12 @@ def main():
     # Model
     parser.add_argument('--model-path', type=str, required=True,
                         help='Path to trained model checkpoint')
-    parser.add_argument('--model-name', type=str,
-                        default='facebook/dinov3-vitb16-pretrain-lvd1689m',
-                        help='DINOv3 model name')
-    parser.add_argument('--image-size', type=int, default=512,
-                        help='Input image size')
-    parser.add_argument('--heatmap-size', type=int, default=512,
-                        help='Output heatmap size')
+    parser.add_argument('--model-name', type=str, default=None,
+                        help='DINOv3 model name (auto-read from config.yaml if not specified)')
+    parser.add_argument('--image-size', type=int, default=None,
+                        help='Input image size (auto-read from config.yaml if not specified)')
+    parser.add_argument('--heatmap-size', type=int, default=None,
+                        help='Output heatmap size (auto-read from config.yaml if not specified)')
 
     # Input/Output
     parser.add_argument('--image-path', type=str, required=True,

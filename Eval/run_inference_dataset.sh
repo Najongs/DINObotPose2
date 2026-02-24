@@ -4,11 +4,10 @@
 # Evaluates trained model on panda-3cam_azure dataset
 
 # Model configuration
-MODEL_PATH="/home/najo/NAS/DIP/DINObotPose2/Train/outputs/dinov3_base_20260224_232440/best_model.pth"
-MODEL_NAME="facebook/dinov3-vitb16-pretrain-lvd1689m"
+MODEL_PATH="/data/public/NAS/DINObotPose2/Train/outputs/dinov3_base_20260225_015412/best_model.pth"
 
 # Dataset
-DATASET_DIR="/home/najo/NAS/DIP/2025_ICRA_Multi_View_Robot_Pose_Estimation/dataset/DREAM_real/panda-3cam_azure/panda-3cam_azure"
+DATASET_DIR="/data/public/NAS/DINObotPose2/Dataset/Converted_dataset/DREAM_to_DREAM/panda-3cam_azure"
 
 # Output
 OUTPUT_DIR="./eval_outputs"
@@ -16,22 +15,17 @@ OUTPUT_DIR="./eval_outputs"
 # Inference parameters
 BATCH_SIZE=16
 NUM_WORKERS=4
-IMAGE_SIZE=512
-HEATMAP_SIZE=512
 
 # Metrics thresholds (matching DREAM defaults)
 KP_AUC_THRESHOLD=20.0    # pixels
 ADD_AUC_THRESHOLD=0.1    # meters
 
-# Run inference
+# Run inference (model-name, image-size, heatmap-size are read from config.yaml automatically)
 python inference_dataset.py \
     --model-path "$MODEL_PATH" \
-    --model-name "$MODEL_NAME" \
     --dataset-dir "$DATASET_DIR" \
     --output-dir "$OUTPUT_DIR" \
     --batch-size $BATCH_SIZE \
     --num-workers $NUM_WORKERS \
-    --image-size $IMAGE_SIZE \
-    --heatmap-size $HEATMAP_SIZE \
     --kp-auc-threshold $KP_AUC_THRESHOLD \
     --add-auc-threshold $ADD_AUC_THRESHOLD

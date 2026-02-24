@@ -337,12 +337,17 @@ class Trainer:
                 'valid_mask': gt_valid_mask
             }
 
+            # Add robot type labels if available
+            if 'robot_type' in batch:
+                gt_dict['robot_type'] = batch['robot_type'].to(self.device)
+
             # Compute loss
             loss, loss_dict = self.criterion(pred_dict, gt_dict)
 
             # Backward pass
             self.optimizer.zero_grad()
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
             self.optimizer.step()
 
             # Record losses
@@ -351,21 +356,27 @@ class Trainer:
 
             # Update progress bar (only on main process)
             if self.is_main_process:
-                pbar.set_postfix({
+                postfix = {
                     'loss': f"{loss_dict['total']:.6f}",
                     'hm': f"{loss_dict['heatmap']:.6f}",
                     'kp3d': f"{loss_dict['kp3d']:.6f}"
-                })
+                }
+                if loss_dict.get('robot_class', 0.0) > 0:
+                    postfix['rc'] = f"{loss_dict['robot_class']:.6f}"
+                pbar.set_postfix(postfix)
 
                 # Log batch losses to wandb every N batches
                 if wandb.run is not None and batch_idx % 10 == 0:
                     try:
                         global_step = epoch * len(self.train_loader) + batch_idx
-                        wandb.log({
+                        batch_log = {
                             'batch/train_loss': loss_dict['total'],
                             'batch/train_heatmap_loss': loss_dict['heatmap'],
                             'batch/train_kp3d_loss': loss_dict['kp3d']
-                        }, step=global_step)
+                        }
+                        if loss_dict.get('robot_class', 0.0) > 0:
+                            batch_log['batch/train_robot_class_loss'] = loss_dict['robot_class']
+                        wandb.log(batch_log, step=global_step)
                     except Exception:
                         pass  # Silently ignore batch logging errors
 
@@ -389,13 +400,18 @@ class Trainer:
         epoch_losses = {
             'total': [],
             'heatmap': [],
-            'kp3d': []
+            'kp3d': [],
+            'robot_class': []
         }
 
         # Metrics collection
         all_kp_projs_est = []
         all_kp_projs_gt = []
         all_kp_pos_gt = []
+
+        # Robot classifier metrics
+        robot_correct = 0
+        robot_total = 0
 
         # Only show progress bar on main process
         if self.is_main_process:
@@ -420,8 +436,19 @@ class Trainer:
                 'valid_mask': gt_valid_mask
             }
 
+            # Add robot type labels if available
+            if 'robot_type' in batch:
+                gt_dict['robot_type'] = batch['robot_type'].to(self.device)
+
             # Compute loss
             _, loss_dict = self.criterion(pred_dict, gt_dict)
+
+            # Robot classifier accuracy
+            if 'robot_type' in pred_dict and 'robot_type' in batch:
+                robot_preds = pred_dict['robot_type'].argmax(dim=-1)
+                robot_labels = batch['robot_type'].to(self.device)
+                robot_correct += (robot_preds == robot_labels).sum().item()
+                robot_total += robot_labels.size(0)
 
             # Record losses
             for key, value in loss_dict.items():
@@ -456,14 +483,23 @@ class Trainer:
 
             # Update progress bar (only on main process)
             if self.is_main_process:
-                pbar.set_postfix({
+                postfix = {
                     'loss': f"{loss_dict['total']:.6f}",
                     'hm': f"{loss_dict['heatmap']:.6f}",
                     'kp3d': f"{loss_dict['kp3d']:.6f}"
-                })
+                }
+                if loss_dict.get('robot_class', 0.0) > 0:
+                    postfix['rc'] = f"{loss_dict['robot_class']:.6f}"
+                if robot_total > 0:
+                    postfix['rc_acc'] = f"{robot_correct / robot_total:.2%}"
+                pbar.set_postfix(postfix)
 
         # Average losses
-        avg_losses = {key: np.mean(values) for key, values in epoch_losses.items()}
+        avg_losses = {key: np.mean(values) if values else 0.0 for key, values in epoch_losses.items()}
+
+        # Add robot classifier accuracy
+        if robot_total > 0:
+            avg_losses['robot_class_acc'] = robot_correct / robot_total
 
         # Synchronize basic losses across processes in distributed training FIRST
         # This prevents NCCL timeout when rank 0 computes expensive metrics
@@ -610,6 +646,8 @@ class Trainer:
                 val_loss_str += ")"
                 print(val_loss_str)
 
+                if 'robot_class_acc' in val_losses:
+                    print(f"  Val Robot Classifier Acc: {val_losses['robot_class_acc']:.2%}")
                 if 'val_pck_auc' in val_losses:
                     print(f"  Val PCK AUC: {val_losses['val_pck_auc']:.4f}, ADD AUC: {val_losses['val_add_auc']:.4f}")
                     print(f"  Val ADD Mean: {val_losses['val_add_mean_mm']:.2f}mm, PnP Succ: {val_losses['val_pnp_success_rate']:.2%}")
@@ -966,6 +1004,8 @@ def main(args):
         'scheduler': args.scheduler,
         'heatmap_weight': args.heatmap_weight,
         'kp3d_weight': args.kp3d_weight,
+        'robot_class_weight': args.robot_class_weight,
+        'use_robot_classifier': args.use_robot_classifier,
         'keypoint_names': keypoint_names,
         'wandb_project': args.wandb_project,
         'wandb_run_name': args.wandb_run_name

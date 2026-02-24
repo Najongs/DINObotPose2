@@ -59,10 +59,10 @@ class TokenFuser(nn.Module):
         self.projection = nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=True)
         self.refine_blocks = nn.Sequential(
             nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(out_channels),
+            nn.GroupNorm(32, out_channels),
             nn.GELU(),
             nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(out_channels)
+            nn.GroupNorm(32, out_channels)
         )
         self.residual_conv = nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=True)
         
@@ -77,17 +77,17 @@ class LightCNNStem(nn.Module):
         super().__init__()
         self.conv_block1 = nn.Sequential(
             nn.Conv2d(3, 16, kernel_size=3, stride=2, padding=1, bias=False), # 1/2
-            nn.BatchNorm2d(16),
+            nn.GroupNorm(4, 16),
             nn.GELU()
         )
         self.conv_block2 = nn.Sequential(
             nn.Conv2d(16, 32, kernel_size=3, stride=2, padding=1, bias=False), # 1/4
-            nn.BatchNorm2d(32),
+            nn.GroupNorm(8, 32),
             nn.GELU()
         )
         self.conv_block3 = nn.Sequential(
             nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1, bias=False), # 1/8
-            nn.BatchNorm2d(64),
+            nn.GroupNorm(16, 64),
             nn.GELU()
         )
         
@@ -103,10 +103,10 @@ class FusedUpsampleBlock(nn.Module):
         self.upsample = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
         self.refine_conv = nn.Sequential(
             nn.Conv2d(in_channels + skip_channels, out_channels, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(out_channels),
+            nn.GroupNorm(min(32, out_channels), out_channels),
             nn.GELU(),
             nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(out_channels),
+            nn.GroupNorm(min(32, out_channels), out_channels),
             nn.GELU()
         )
 
@@ -136,23 +136,23 @@ class UNetViTKeypointHead(nn.Module):
             self.decoder_block2 = FusedUpsampleBlock(in_channels=128, skip_channels=32, out_channels=64)
             self.decoder_block3 = FusedUpsampleBlock(in_channels=64, skip_channels=16, out_channels=32)
         else:
-            # ViT-only decoder without skip connections
+            # ViT-only decoder without skip connections (GroupNorm for sim-to-real robustness)
             self.decoder_block1 = nn.Sequential(
                 nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True),
                 nn.Conv2d(256, 128, kernel_size=3, padding=1, bias=False),
-                nn.BatchNorm2d(128),
+                nn.GroupNorm(32, 128),
                 nn.GELU()
             )
             self.decoder_block2 = nn.Sequential(
                 nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True),
                 nn.Conv2d(128, 64, kernel_size=3, padding=1, bias=False),
-                nn.BatchNorm2d(64),
+                nn.GroupNorm(16, 64),
                 nn.GELU()
             )
             self.decoder_block3 = nn.Sequential(
                 nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True),
                 nn.Conv2d(64, 32, kernel_size=3, padding=1, bias=False),
-                nn.BatchNorm2d(32),
+                nn.GroupNorm(8, 32),
                 nn.GELU()
             )
 
@@ -202,69 +202,76 @@ class RobotClassifierHead(nn.Module):
         x = self.pooler(x).squeeze(-1) # (B, D)
         return self.classifier(x)
 
-class Keypoint3DHead(nn.Module):
+class EnhancedKeypoint3DHead(nn.Module):
     """
-    Predicts 3D coordinates (x, y, z) for each joint by pooling backbone features 
-    at predicted 2D keypoint locations and reasoning about joint relationships.
+    Predicts 3D coordinates (x, y, z) by combining DINOv3 features with
+    explicit Joint Embeddings to learn kinematic constraints.
     """
     def __init__(self, input_dim=FEATURE_DIM, num_joints=NUM_JOINTS):
         super().__init__()
         self.num_joints = num_joints
-        
+        self.hidden_dim = 256
+
         # 1. Per-joint feature refinement
         self.joint_feature_net = nn.Sequential(
-            nn.Linear(input_dim, 256),
+            nn.Linear(input_dim, self.hidden_dim),
             nn.GELU(),
-            nn.LayerNorm(256)
+            nn.LayerNorm(self.hidden_dim)
         )
-        
-        # 2. Self-attention to model spatial/kinematic constraints between joints
+
+        # 2. Joint Identity Embedding
+        # Tells the transformer "this feature is 'Base'", "this is 'Wrist'" etc.
+        self.joint_embedding = nn.Embedding(num_joints, self.hidden_dim)
+
+        # 3. Deeper Self-attention for kinematic constraint learning
         encoder_layer = nn.TransformerEncoderLayer(
-            d_model=256,
-            nhead=4,
-            dim_feedforward=512,
+            d_model=self.hidden_dim,
+            nhead=8,
+            dim_feedforward=1024,
             dropout=0.1,
             activation='gelu',
             batch_first=True
         )
-        self.joint_relation_net = nn.TransformerEncoder(encoder_layer, num_layers=2)
-        
-        # 3. Predict 3D coordinates (x, y, z) for each joint individually
+        self.joint_relation_net = nn.TransformerEncoder(encoder_layer, num_layers=4)
+
+        # 4. Predict 3D coordinates (x, y, z)
         self.coord_predictor = nn.Sequential(
-            nn.Linear(256, 128),
+            nn.Linear(self.hidden_dim, 128),
             nn.GELU(),
             nn.LayerNorm(128),
-            nn.Linear(128, 3) # Output: (x, y, z) for each joint
+            nn.Linear(128, 3)
         )
-    
+
     def forward(self, dino_features, predicted_heatmaps):
         b, n, d = dino_features.shape
         h = w = int(math.sqrt(n))
-        
-        # 1. Reshape DINO features to (B, D, H, W)
+
         feat_map = dino_features.permute(0, 2, 1).reshape(b, d, h, w)
-        
-        # 2. Weighted pooling of features for each joint (Spatial Softmax approach)
-        # Resize heatmaps to match DINO feature map size
+
+        # Spatial Softmax Pooling
         weights = F.interpolate(predicted_heatmaps, size=(h, w), mode='bilinear', align_corners=False)
-        weights = torch.clamp(weights, min=0) # Remove negative activations
-        
-        # Apply Softmax across spatial dimensions to create attention masks
+        weights = torch.clamp(weights, min=0)
+
         weights_flat = weights.reshape(b, self.num_joints, -1)
-        weights_norm = F.softmax(weights_flat / 0.1, dim=-1) # Temperature 0.1 sharpens the focus
+        weights_norm = F.softmax(weights_flat / 0.1, dim=-1)
         weights_norm = weights_norm.reshape(b, self.num_joints, h, w)
-        
-        # Extract features focused on joint locations: output shape (B, NJ, D)
-        joint_features = torch.einsum('bdhw,bjhw->bjd', feat_map, weights_norm)
-        
-        # 3. Refine features and model kinematic relations via Transformer
-        refined_features = self.joint_feature_net(joint_features)     # (B, NJ, 256)
-        related_features = self.joint_relation_net(refined_features)  # (B, NJ, 256)
-        
-        # 4. Predict 3D coordinates (x, y, z) for each of the NJ joints
-        # Apply to each joint independently, maintaining the (B, NJ, 3) shape
-        pred_kpts_3d = self.coord_predictor(related_features)         # (B, NJ, 3)
-        
+
+        joint_features = torch.einsum('bdhw,bjhw->bjd', feat_map, weights_norm)  # (B, NJ, D)
+
+        # 1. Feature refinement
+        refined_features = self.joint_feature_net(joint_features)  # (B, NJ, 256)
+
+        # 2. Add Joint Identity Embedding
+        joint_ids = torch.arange(self.num_joints, device=dino_features.device).expand(b, self.num_joints)
+        joint_embeds = self.joint_embedding(joint_ids)  # (B, NJ, 256)
+        fused_features = refined_features + joint_embeds
+
+        # 3. Learn inter-joint kinematic relations
+        related_features = self.joint_relation_net(fused_features)  # (B, NJ, 256)
+
+        # 4. 3D coordinate regression
+        pred_kpts_3d = self.coord_predictor(related_features)  # (B, NJ, 3)
+
         return pred_kpts_3d
 
 class DINOv3PoseEstimator(nn.Module):
@@ -301,8 +308,8 @@ class DINOv3PoseEstimator(nn.Module):
             use_cnn_stem=use_cnn_stem
         )
 
-        # 2. 3D Keypoint Predictor (Replaced Angle Head)
-        self.keypoint_3d_head = Keypoint3DHead(input_dim=feature_dim, num_joints=NUM_JOINTS)
+        # 2. 3D Keypoint Predictor with Joint Embeddings
+        self.keypoint_3d_head = EnhancedKeypoint3DHead(input_dim=feature_dim, num_joints=NUM_JOINTS)
 
     def forward(self, image_tensor_batch):
         # 1. Extract visual representations

@@ -4,16 +4,19 @@
 # Evaluates trained model on panda-3cam_azure dataset
 
 # Model configuration
-MODEL_PATH="/data/public/NAS/DINObotPose2/Train/outputs/dinov3_base_20260225_032708/best_model.pth"
+MODEL_PATH="/data/public/NAS/DINObotPose2/Train/outputs/dinov3_base_20260225_125129/best_model.pth"
 
 # Dataset
-DATASET_DIR="/data/public/NAS/DINObotPose2/Dataset/Converted_dataset/DREAM_to_DREAM/panda-orb"
-
+DATASET_DIR="/data/public/NAS/DINObotPose2/Dataset/Converted_dataset/DREAM_to_DREAM/panda-3cam_azure"
+# /data/public/NAS/DINObotPose2/Dataset/Converted_dataset/DREAM_to_DREAM/panda-3cam_azure
+# /data/public/NAS/DINObotPose2/Dataset/Converted_dataset/DREAM_to_DREAM/panda-3cam_kinect360
+# /data/public/NAS/DINObotPose2/Dataset/Converted_dataset/DREAM_to_DREAM/panda-3cam_realsense
+# /data/public/NAS/DINObotPose2/Dataset/Converted_dataset/DREAM_to_DREAM/panda-orb
 # Output
 OUTPUT_DIR="./eval_outputs"
 
 # Inference parameters
-BATCH_SIZE=16
+BATCH_SIZE=64
 NUM_WORKERS=4
 
 # Metrics thresholds (matching DREAM defaults)

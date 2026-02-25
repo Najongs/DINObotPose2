@@ -17,9 +17,7 @@ IMAGE_SIZE=512
 HEATMAP_SIZE=512
 UNFREEZE_BLOCKS=2  # Number of backbone blocks to unfreeze for fine-tuning
 
-USE_CNN_STEM=False  # Disabled for sim-to-real: CNN stem overfits to synthetic textures
-USE_ROBOT_CLASSIFIER=False  # Enable robot type classification (4 classes)
-USE_ENHANCED_3D=False  # Use EnhancedKeypoint3DHead (joint embeddings + deeper transformer)
+USE_JOINT_EMBEDDING=True  # Enable joint identity embeddings in 3D head
 
 # FDA (Fourier Domain Adaptation) for sim-to-real
 FDA_REAL_DIR="/data/public/NAS/DINObotPose2/Dataset/DREAM_real"  # Real images (no labels needed)
@@ -39,7 +37,6 @@ SCHEDULER="cosine"  # Options: step, cosine, plateau, none
 # Loss weights
 HEATMAP_WEIGHT=1.0
 KP3D_WEIGHT=1.0
-ROBOT_CLASS_WEIGHT=1.0
 
 # Output and logging
 OUTPUT_DIR="./outputs/dinov3_base_$(date +%Y%m%d_%H%M%S)"
@@ -68,6 +65,13 @@ GPU_IDS="0,1,2"  # 사용할 GPU ID (예: "0,1,2,3")
 # Execute Training
 # =============================================================================
 
+# Build joint embedding flag
+if [ "${USE_JOINT_EMBEDDING}" = "True" ] || [ "${USE_JOINT_EMBEDDING}" = "true" ]; then
+    JOINT_EMBEDDING_FLAG="--use-joint-embedding"
+else
+    JOINT_EMBEDDING_FLAG=""
+fi
+
 # Build base command
 BASE_CMD="python train.py \
     --data-dir ${DATA_DIR} \
@@ -76,6 +80,7 @@ BASE_CMD="python train.py \
     --image-size ${IMAGE_SIZE} \
     --heatmap-size ${HEATMAP_SIZE} \
     --unfreeze-blocks ${UNFREEZE_BLOCKS} \
+    ${JOINT_EMBEDDING_FLAG} \
     --epochs ${EPOCHS} \
     --batch-size ${BATCH_SIZE} \
     --num-workers ${NUM_WORKERS} \
@@ -86,7 +91,6 @@ BASE_CMD="python train.py \
     --scheduler ${SCHEDULER} \
     --heatmap-weight ${HEATMAP_WEIGHT} \
     --kp3d-weight ${KP3D_WEIGHT} \
-    --robot-class-weight ${ROBOT_CLASS_WEIGHT} \
     --output-dir ${OUTPUT_DIR} \
     --wandb-project ${WANDB_PROJECT} \
     --seed ${SEED}"
@@ -94,23 +98,6 @@ BASE_CMD="python train.py \
 # Add FDA flags
 if [ -n "${FDA_REAL_DIR}" ] && [ "${FDA_PROB}" != "0.0" ]; then
     BASE_CMD="${BASE_CMD} --fda-real-dir ${FDA_REAL_DIR} --fda-beta ${FDA_BETA} --fda-prob ${FDA_PROB}"
-fi
-
-# Add CNN stem flag
-if [ "${USE_CNN_STEM}" = "True" ] || [ "${USE_CNN_STEM}" = "true" ]; then
-    BASE_CMD="${BASE_CMD} --use-cnn-stem"
-else
-    BASE_CMD="${BASE_CMD} --no-cnn-stem"
-fi
-
-# Add robot classifier flag
-if [ "${USE_ROBOT_CLASSIFIER}" = "True" ] || [ "${USE_ROBOT_CLASSIFIER}" = "true" ]; then
-    BASE_CMD="${BASE_CMD} --use-robot-classifier"
-fi
-
-# Add enhanced 3D head flag
-if [ "${USE_ENHANCED_3D}" = "True" ] || [ "${USE_ENHANCED_3D}" = "true" ]; then
-    BASE_CMD="${BASE_CMD} --use-enhanced-3d"
 fi
 
 # Add WandB run name if specified
@@ -141,27 +128,6 @@ elif [ "${TRAIN_MODE}" = "multi_gpu" ]; then
     # Set CUDA_VISIBLE_DEVICES for multi-GPU
     export CUDA_VISIBLE_DEVICES=${GPU_IDS}
 
-    # Build CNN stem flag
-    if [ "${USE_CNN_STEM}" = "True" ] || [ "${USE_CNN_STEM}" = "true" ]; then
-        CNN_STEM_FLAG="--use-cnn-stem"
-    else
-        CNN_STEM_FLAG="--no-cnn-stem"
-    fi
-
-    # Build robot classifier flag
-    if [ "${USE_ROBOT_CLASSIFIER}" = "True" ] || [ "${USE_ROBOT_CLASSIFIER}" = "true" ]; then
-        ROBOT_CLASSIFIER_FLAG="--use-robot-classifier"
-    else
-        ROBOT_CLASSIFIER_FLAG=""
-    fi
-
-    # Build enhanced 3D head flag
-    if [ "${USE_ENHANCED_3D}" = "True" ] || [ "${USE_ENHANCED_3D}" = "true" ]; then
-        ENHANCED_3D_FLAG="--use-enhanced-3d"
-    else
-        ENHANCED_3D_FLAG=""
-    fi
-
     # Use torchrun for distributed training
     torchrun \
         --standalone \
@@ -174,9 +140,7 @@ elif [ "${TRAIN_MODE}" = "multi_gpu" ]; then
         --image-size ${IMAGE_SIZE} \
         --heatmap-size ${HEATMAP_SIZE} \
         --unfreeze-blocks ${UNFREEZE_BLOCKS} \
-        ${CNN_STEM_FLAG} \
-        ${ROBOT_CLASSIFIER_FLAG} \
-        ${ENHANCED_3D_FLAG} \
+        ${JOINT_EMBEDDING_FLAG} \
         --epochs ${EPOCHS} \
         --batch-size ${BATCH_SIZE} \
         --num-workers ${NUM_WORKERS} \
@@ -187,7 +151,6 @@ elif [ "${TRAIN_MODE}" = "multi_gpu" ]; then
         --scheduler ${SCHEDULER} \
         --heatmap-weight ${HEATMAP_WEIGHT} \
         --kp3d-weight ${KP3D_WEIGHT} \
-        --robot-class-weight ${ROBOT_CLASS_WEIGHT} \
         --output-dir ${OUTPUT_DIR} \
         --wandb-project ${WANDB_PROJECT} \
         $([ -n "${WANDB_RUN_NAME}" ] && echo "--wandb-run-name ${WANDB_RUN_NAME}") \

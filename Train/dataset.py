@@ -5,6 +5,8 @@ DREAM 데이터셋 구조를 따르는 데이터로더
 
 import os
 import json
+import random
+import glob
 import numpy as np
 from PIL import Image as PILImage
 import torch
@@ -12,6 +14,49 @@ from torch.utils.data import Dataset
 import torchvision.transforms as transforms
 import albumentations as albu
 from typing import Dict, List, Tuple, Optional
+
+
+def fda_transfer(src_img: np.ndarray, trg_img: np.ndarray, beta: float = 0.01) -> np.ndarray:
+    """
+    FDA (Fourier Domain Adaptation): Replace low-frequency spectrum of source with target's.
+    Low-freq = overall color/tone (domain-specific), High-freq = edges/structure (task-relevant).
+
+    Args:
+        src_img: Synthetic image (H, W, 3), uint8
+        trg_img: Real image (H, W, 3), uint8
+        beta: Low-frequency replacement ratio (0.01~0.05 recommended for DR data)
+    Returns:
+        FDA-applied image (H, W, 3), uint8
+    """
+    src = src_img.astype(np.float32)
+    trg = trg_img.astype(np.float32)
+
+    # Resize target to match source
+    if src.shape[:2] != trg.shape[:2]:
+        trg = np.array(PILImage.fromarray(trg.astype(np.uint8)).resize(
+            (src.shape[1], src.shape[0]), PILImage.BILINEAR
+        )).astype(np.float32)
+
+    result = np.zeros_like(src)
+    h, w = src.shape[:2]
+    cy, cx = h // 2, w // 2
+    bh, bw = max(int(h * beta), 1), max(int(w * beta), 1)
+
+    for ch in range(3):
+        fft_src = np.fft.fftshift(np.fft.fft2(src[:, :, ch]))
+        fft_trg = np.fft.fftshift(np.fft.fft2(trg[:, :, ch]))
+
+        amp_src = np.abs(fft_src)
+        phase_src = np.angle(fft_src)
+        amp_trg = np.abs(fft_trg)
+
+        # Replace low-frequency amplitude
+        amp_src[cy - bh:cy + bh, cx - bw:cx + bw] = amp_trg[cy - bh:cy + bh, cx - bw:cx + bw]
+
+        fft_result = np.fft.ifftshift(amp_src * np.exp(1j * phase_src))
+        result[:, :, ch] = np.real(np.fft.ifft2(fft_result))
+
+    return np.clip(result, 0, 255).astype(np.uint8)
 
 
 # Robot type constants (must match model.py)
@@ -65,7 +110,10 @@ class PoseEstimationDataset(Dataset):
         include_angles: bool = True,
         sigma: float = 5.0,  # Gaussian heatmap sigma
         multi_robot: bool = False,  # Load data from multiple robot subdirectories
-        robot_types: Optional[List[str]] = None  # List of robot types to include
+        robot_types: Optional[List[str]] = None,  # List of robot types to include
+        fda_real_dir: Optional[str] = None,  # Real image directory for FDA augmentation
+        fda_beta: float = 0.01,  # FDA low-frequency replacement ratio
+        fda_prob: float = 0.5,  # Probability of applying FDA per sample
     ):
         """
         Args:
@@ -79,6 +127,9 @@ class PoseEstimationDataset(Dataset):
             sigma: Gaussian heatmap의 표준편차
             multi_robot: True면 data_dir 하위의 모든 로봇 데이터를 통합하여 로드
             robot_types: multi_robot=True일 때 특정 로봇 타입만 필터링 (예: ['panda', 'kuka'])
+            fda_real_dir: Real 이미지 디렉토리 (FDA style source, label 불필요)
+            fda_beta: FDA 저주파 교체 비율 (0.01=미세한 톤 변화, 0.05=강한 변환)
+            fda_prob: FDA 적용 확률 (0.5 = 50%의 샘플에 적용)
         """
         self.data_dir = data_dir
         self.keypoint_names = keypoint_names
@@ -89,6 +140,18 @@ class PoseEstimationDataset(Dataset):
         self.sigma = sigma
         self.multi_robot = multi_robot
         self.robot_types = robot_types
+        self.fda_beta = fda_beta
+        self.fda_prob = fda_prob
+
+        # FDA: Load real image paths for style transfer
+        self.fda_real_paths = []
+        if fda_real_dir and os.path.isdir(fda_real_dir):
+            for ext in ['*.jpg', '*.png', '*.jpeg']:
+                self.fda_real_paths.extend(glob.glob(os.path.join(fda_real_dir, '**', ext), recursive=True))
+            if self.fda_real_paths:
+                print(f"FDA enabled: {len(self.fda_real_paths)} real images from {fda_real_dir} (beta={fda_beta}, prob={fda_prob})")
+            else:
+                print(f"FDA warning: No images found in {fda_real_dir}")
 
         # 데이터 파일 리스트 로드
         self.samples = self._load_dataset()
@@ -343,6 +406,16 @@ class PoseEstimationDataset(Dataset):
         # Keypoint 로드
         keypoints_data = self._load_keypoints_from_json(sample_info['annotation_path'])
         keypoints = keypoints_data['projections'].copy()  # (N, 2) [x, y]
+
+        # FDA augmentation (applied before other augmentations)
+        if self.fda_real_paths and random.random() < self.fda_prob:
+            real_path = random.choice(self.fda_real_paths)
+            try:
+                real_img = np.array(PILImage.open(real_path).convert('RGB'))
+                src_img = np.array(image)
+                image = PILImage.fromarray(fda_transfer(src_img, real_img, beta=self.fda_beta))
+            except Exception:
+                pass  # Skip FDA on error, use original image
 
         # 데이터 증강 적용
         if self.augment and len(keypoints) > 0:

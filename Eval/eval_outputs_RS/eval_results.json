@@ -1,0 +1,24 @@
+{
+    "dataset": "/data/public/NAS/DINObotPose2/Dataset/Converted_dataset/DREAM_to_DREAM/panda-3cam_realsense",
+    "model": "/data/public/NAS/DINObotPose2/Train/outputs/dinov3_base_20260225_032708/best_model.pth",
+    "num_frames": 5944,
+    "keypoint_metrics": {
+        "num_gt_inframe": 41397.0,
+        "num_found_gt_inframe": 41397.0,
+        "l2_error_mean_px": 3.846940040588379,
+        "l2_error_median_px": 3.6496119499206543,
+        "l2_error_std_px": 3.3632001876831055,
+        "l2_error_auc": 0.8116016257216706,
+        "l2_error_auc_thresh_px": 20.0
+    },
+    "pnp_metrics": {
+        "num_pnp_found": 5944.0,
+        "num_pnp_not_found": 0.0,
+        "num_pnp_possible": 5944.0,
+        "add_mean": 0.020226585879073757,
+        "add_median": 0.014178424047227248,
+        "add_std": 0.026384791718119492,
+        "add_auc": 0.8146954660161507,
+        "add_auc_thresh": 0.1
+    }
+}

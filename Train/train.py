@@ -817,7 +817,10 @@ def main(args):
             heatmap_size=(args.heatmap_size, args.heatmap_size),
             augment=True,
             multi_robot=args.multi_robot,
-            robot_types=args.robot_types
+            robot_types=args.robot_types,
+            fda_real_dir=args.fda_real_dir,
+            fda_beta=args.fda_beta,
+            fda_prob=args.fda_prob
         )
 
         # Split into train/val with reproducible split
@@ -908,7 +911,8 @@ def main(args):
         heatmap_size=(args.heatmap_size, args.heatmap_size),
         unfreeze_blocks=args.unfreeze_blocks,
         use_cnn_stem=args.use_cnn_stem,
-        use_robot_classifier=args.use_robot_classifier
+        use_robot_classifier=args.use_robot_classifier,
+        use_enhanced_3d=args.use_enhanced_3d
     ).to(device)
 
     # Wrap model with DistributedDataParallel for multi-GPU training
@@ -1006,6 +1010,7 @@ def main(args):
         'kp3d_weight': args.kp3d_weight,
         'robot_class_weight': args.robot_class_weight,
         'use_robot_classifier': args.use_robot_classifier,
+        'use_enhanced_3d': args.use_enhanced_3d,
         'keypoint_names': keypoint_names,
         'wandb_project': args.wandb_project,
         'wandb_run_name': args.wandb_run_name
@@ -1051,6 +1056,14 @@ if __name__ == '__main__':
     parser.add_argument('--robot-types', type=str, nargs='+', default=None,
                         help='Filter specific robot types (e.g., panda kuka baxter)')
 
+    # FDA (Fourier Domain Adaptation) for sim-to-real
+    parser.add_argument('--fda-real-dir', type=str, default=None,
+                        help='Real image directory for FDA style transfer (no labels needed)')
+    parser.add_argument('--fda-beta', type=float, default=0.01,
+                        help='FDA low-frequency replacement ratio (0.01=subtle, 0.05=strong)')
+    parser.add_argument('--fda-prob', type=float, default=0.5,
+                        help='Probability of applying FDA per sample')
+
     # Model
     parser.add_argument('--model-name', type=str,
                         default='facebook/dinov2-base',
@@ -1067,6 +1080,8 @@ if __name__ == '__main__':
                         help='Disable CNN stem and use ViT-only decoder')
     parser.add_argument('--use-robot-classifier', action='store_true', default=False,
                         help='Enable robot type classification head')
+    parser.add_argument('--use-enhanced-3d', action='store_true', default=False,
+                        help='Use EnhancedKeypoint3DHead with joint embeddings and deeper transformer')
 
     # Training
     parser.add_argument('--epochs', type=int, default=100,

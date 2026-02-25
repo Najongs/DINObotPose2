@@ -1,0 +1,24 @@
+{
+    "dataset": "/data/public/NAS/DINObotPose2/Dataset/Converted_dataset/DREAM_to_DREAM/panda-orb",
+    "model": "/data/public/NAS/DINObotPose2/Train/outputs/dinov3_base_20260225_032708/best_model.pth",
+    "num_frames": 32315,
+    "keypoint_metrics": {
+        "num_gt_inframe": 224309.0,
+        "num_found_gt_inframe": 224309.0,
+        "l2_error_mean_px": 5.034646034240723,
+        "l2_error_median_px": 3.64080548286438,
+        "l2_error_std_px": 10.6639404296875,
+        "l2_error_auc": 0.7756912272802251,
+        "l2_error_auc_thresh_px": 20.0
+    },
+    "pnp_metrics": {
+        "num_pnp_found": 32315.0,
+        "num_pnp_not_found": 0.0,
+        "num_pnp_possible": 32315.0,
+        "add_mean": 0.04721927715646389,
+        "add_median": 0.019403098032923793,
+        "add_std": 0.10149669464465588,
+        "add_auc": 0.7123643323533962,
+        "add_auc_thresh": 0.1
+    }
+}

@@ -19,6 +19,12 @@ UNFREEZE_BLOCKS=2  # Number of backbone blocks to unfreeze for fine-tuning
 
 USE_CNN_STEM=False  # Disabled for sim-to-real: CNN stem overfits to synthetic textures
 USE_ROBOT_CLASSIFIER=False  # Enable robot type classification (4 classes)
+USE_ENHANCED_3D=False  # Use EnhancedKeypoint3DHead (joint embeddings + deeper transformer)
+
+# FDA (Fourier Domain Adaptation) for sim-to-real
+FDA_REAL_DIR="/data/public/NAS/DINObotPose2/Dataset/DREAM_real"  # Real images (no labels needed)
+FDA_BETA=0.01   # Low-freq replacement ratio (0.01=subtle tone shift, 0.05=strong)
+FDA_PROB=0.5    # Probability of applying FDA per sample (0.0 to disable)
 
 # Training hyperparameters
 EPOCHS=50
@@ -85,6 +91,11 @@ BASE_CMD="python train.py \
     --wandb-project ${WANDB_PROJECT} \
     --seed ${SEED}"
 
+# Add FDA flags
+if [ -n "${FDA_REAL_DIR}" ] && [ "${FDA_PROB}" != "0.0" ]; then
+    BASE_CMD="${BASE_CMD} --fda-real-dir ${FDA_REAL_DIR} --fda-beta ${FDA_BETA} --fda-prob ${FDA_PROB}"
+fi
+
 # Add CNN stem flag
 if [ "${USE_CNN_STEM}" = "True" ] || [ "${USE_CNN_STEM}" = "true" ]; then
     BASE_CMD="${BASE_CMD} --use-cnn-stem"
@@ -95,6 +106,11 @@ fi
 # Add robot classifier flag
 if [ "${USE_ROBOT_CLASSIFIER}" = "True" ] || [ "${USE_ROBOT_CLASSIFIER}" = "true" ]; then
     BASE_CMD="${BASE_CMD} --use-robot-classifier"
+fi
+
+# Add enhanced 3D head flag
+if [ "${USE_ENHANCED_3D}" = "True" ] || [ "${USE_ENHANCED_3D}" = "true" ]; then
+    BASE_CMD="${BASE_CMD} --use-enhanced-3d"
 fi
 
 # Add WandB run name if specified
@@ -139,6 +155,13 @@ elif [ "${TRAIN_MODE}" = "multi_gpu" ]; then
         ROBOT_CLASSIFIER_FLAG=""
     fi
 
+    # Build enhanced 3D head flag
+    if [ "${USE_ENHANCED_3D}" = "True" ] || [ "${USE_ENHANCED_3D}" = "true" ]; then
+        ENHANCED_3D_FLAG="--use-enhanced-3d"
+    else
+        ENHANCED_3D_FLAG=""
+    fi
+
     # Use torchrun for distributed training
     torchrun \
         --standalone \
@@ -153,6 +176,7 @@ elif [ "${TRAIN_MODE}" = "multi_gpu" ]; then
         --unfreeze-blocks ${UNFREEZE_BLOCKS} \
         ${CNN_STEM_FLAG} \
         ${ROBOT_CLASSIFIER_FLAG} \
+        ${ENHANCED_3D_FLAG} \
         --epochs ${EPOCHS} \
         --batch-size ${BATCH_SIZE} \
         --num-workers ${NUM_WORKERS} \
@@ -168,6 +192,7 @@ elif [ "${TRAIN_MODE}" = "multi_gpu" ]; then
         --wandb-project ${WANDB_PROJECT} \
         $([ -n "${WANDB_RUN_NAME}" ] && echo "--wandb-run-name ${WANDB_RUN_NAME}") \
         $([ -n "${RESUME}" ] && echo "--resume ${RESUME}") \
+        $([ -n "${FDA_REAL_DIR}" ] && [ "${FDA_PROB}" != "0.0" ] && echo "--fda-real-dir ${FDA_REAL_DIR} --fda-beta ${FDA_BETA} --fda-prob ${FDA_PROB}") \
         --seed ${SEED}
 else
     echo "Error: Unknown training mode: ${TRAIN_MODE}"

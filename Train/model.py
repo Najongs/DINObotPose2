@@ -202,6 +202,64 @@ class RobotClassifierHead(nn.Module):
         x = self.pooler(x).squeeze(-1) # (B, D)
         return self.classifier(x)
 
+class Keypoint3DHead(nn.Module):
+    """
+    Predicts 3D coordinates (x, y, z) for each joint by pooling backbone features
+    at predicted 2D keypoint locations and reasoning about joint relationships.
+    """
+    def __init__(self, input_dim=FEATURE_DIM, num_joints=NUM_JOINTS):
+        super().__init__()
+        self.num_joints = num_joints
+
+        # 1. Per-joint feature refinement
+        self.joint_feature_net = nn.Sequential(
+            nn.Linear(input_dim, 256),
+            nn.GELU(),
+            nn.LayerNorm(256)
+        )
+
+        # 2. Self-attention to model spatial/kinematic constraints between joints
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=256,
+            nhead=4,
+            dim_feedforward=512,
+            dropout=0.1,
+            activation='gelu',
+            batch_first=True
+        )
+        self.joint_relation_net = nn.TransformerEncoder(encoder_layer, num_layers=2)
+
+        # 3. Predict 3D coordinates (x, y, z) for each joint individually
+        self.coord_predictor = nn.Sequential(
+            nn.Linear(256, 128),
+            nn.GELU(),
+            nn.LayerNorm(128),
+            nn.Linear(128, 3)
+        )
+
+    def forward(self, dino_features, predicted_heatmaps):
+        b, n, d = dino_features.shape
+        h = w = int(math.sqrt(n))
+
+        feat_map = dino_features.permute(0, 2, 1).reshape(b, d, h, w)
+
+        weights = F.interpolate(predicted_heatmaps, size=(h, w), mode='bilinear', align_corners=False)
+        weights = torch.clamp(weights, min=0)
+
+        weights_flat = weights.reshape(b, self.num_joints, -1)
+        weights_norm = F.softmax(weights_flat / 0.1, dim=-1)
+        weights_norm = weights_norm.reshape(b, self.num_joints, h, w)
+
+        joint_features = torch.einsum('bdhw,bjhw->bjd', feat_map, weights_norm)
+
+        refined_features = self.joint_feature_net(joint_features)
+        related_features = self.joint_relation_net(refined_features)
+
+        pred_kpts_3d = self.coord_predictor(related_features)
+
+        return pred_kpts_3d
+
+
 class EnhancedKeypoint3DHead(nn.Module):
     """
     Predicts 3D coordinates (x, y, z) by combining DINOv3 features with
@@ -275,11 +333,12 @@ class EnhancedKeypoint3DHead(nn.Module):
         return pred_kpts_3d
 
 class DINOv3PoseEstimator(nn.Module):
-    def __init__(self, dino_model_name, heatmap_size, unfreeze_blocks=2, use_cnn_stem=True, use_robot_classifier=False):
+    def __init__(self, dino_model_name, heatmap_size, unfreeze_blocks=2, use_cnn_stem=True, use_robot_classifier=False, use_enhanced_3d=False):
         super().__init__()
         self.dino_model_name = dino_model_name
         self.use_cnn_stem = use_cnn_stem
         self.use_robot_classifier = use_robot_classifier
+        self.use_enhanced_3d = use_enhanced_3d
         self.backbone = DINOv3Backbone(dino_model_name, unfreeze_blocks=unfreeze_blocks)
 
         if "siglip" in self.dino_model_name:
@@ -308,8 +367,11 @@ class DINOv3PoseEstimator(nn.Module):
             use_cnn_stem=use_cnn_stem
         )
 
-        # 2. 3D Keypoint Predictor with Joint Embeddings
-        self.keypoint_3d_head = EnhancedKeypoint3DHead(input_dim=feature_dim, num_joints=NUM_JOINTS)
+        # 2. 3D Keypoint Predictor
+        if use_enhanced_3d:
+            self.keypoint_3d_head = EnhancedKeypoint3DHead(input_dim=feature_dim, num_joints=NUM_JOINTS)
+        else:
+            self.keypoint_3d_head = Keypoint3DHead(input_dim=feature_dim, num_joints=NUM_JOINTS)
 
     def forward(self, image_tensor_batch):
         # 1. Extract visual representations

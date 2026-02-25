@@ -9,6 +9,7 @@ __pycache__/
 outputs/
 .claude/
 Dataset/
+DREAM/
 
 # Distribution / packaging
 .Python

@@ -144,9 +144,7 @@ def network_inference(args):
     checkpoint_dir = Path(args.model_path).parent
     config_path = checkpoint_dir / 'config.yaml'
 
-    use_cnn_stem = False
-    use_robot_classifier = False
-    use_enhanced_3d = False
+    use_joint_embedding = False
     model_name = args.model_name
     image_size = 512
     heatmap_size = 512
@@ -154,15 +152,13 @@ def network_inference(args):
     if config_path.exists():
         with open(config_path, 'r') as f:
             train_config = yaml.safe_load(f)
-        use_cnn_stem = train_config.get('use_cnn_stem', False)
-        use_robot_classifier = train_config.get('use_robot_classifier', False)
-        use_enhanced_3d = train_config.get('use_enhanced_3d', False)
+        use_joint_embedding = train_config.get('use_joint_embedding', False)
         model_name = train_config.get('model_name', model_name)
         image_size = int(train_config.get('image_size', image_size))
         heatmap_size = int(train_config.get('heatmap_size', heatmap_size))
         if 'keypoint_names' in train_config:
             keypoint_names = train_config['keypoint_names']
-        print(f"# Config: use_cnn_stem={use_cnn_stem}, use_enhanced_3d={use_enhanced_3d}")
+        print(f"# Config: use_joint_embedding={use_joint_embedding}")
 
     # Load annotation JSON
     print(f"\n# Loading annotation: {args.json_path}")
@@ -183,9 +179,7 @@ def network_inference(args):
         dino_model_name=model_name,
         heatmap_size=(heatmap_size, heatmap_size),
         unfreeze_blocks=0,
-        use_cnn_stem=use_cnn_stem,
-        use_robot_classifier=use_robot_classifier,
-        use_enhanced_3d=use_enhanced_3d
+        use_joint_embedding=use_joint_embedding
     ).to(device)
 
     # Load checkpoint

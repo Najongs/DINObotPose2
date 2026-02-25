@@ -351,13 +351,11 @@ def run_inference(args):
     model_name = args.model_name or train_config.get('model_name', 'facebook/dinov2-base')
     image_size = args.image_size or int(train_config.get('image_size', 512))
     heatmap_size = args.heatmap_size or int(train_config.get('heatmap_size', 512))
-    use_cnn_stem = train_config.get('use_cnn_stem', True)
-    use_robot_classifier = train_config.get('use_robot_classifier', False)
-    use_enhanced_3d = train_config.get('use_enhanced_3d', False)
+    use_joint_embedding = train_config.get('use_joint_embedding', False)
 
     print(f"  model_name: {model_name}")
     print(f"  image_size: {image_size}, heatmap_size: {heatmap_size}")
-    print(f"  use_cnn_stem: {use_cnn_stem}, use_robot_classifier: {use_robot_classifier}, use_enhanced_3d: {use_enhanced_3d}")
+    print(f"  use_joint_embedding: {use_joint_embedding}")
 
     # Create dataset
     dataset = InferenceDataset(
@@ -382,9 +380,7 @@ def run_inference(args):
         dino_model_name=model_name,
         heatmap_size=(heatmap_size, heatmap_size),
         unfreeze_blocks=0,  # Not needed for inference
-        use_cnn_stem=use_cnn_stem,
-        use_robot_classifier=use_robot_classifier,
-        use_enhanced_3d=use_enhanced_3d
+        use_joint_embedding=use_joint_embedding
     ).to(device)
 
     # Load checkpoint

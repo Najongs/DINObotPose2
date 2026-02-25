@@ -244,14 +244,12 @@ def inference_single_image(args):
     model_name = args.model_name or train_config.get('model_name', 'facebook/dinov2-base')
     image_size = args.image_size or int(train_config.get('image_size', 512))
     heatmap_size = args.heatmap_size or int(train_config.get('heatmap_size', 512))
-    use_cnn_stem = train_config.get('use_cnn_stem', True)
-    use_robot_classifier = train_config.get('use_robot_classifier', False)
-    use_enhanced_3d = train_config.get('use_enhanced_3d', False)
+    use_joint_embedding = train_config.get('use_joint_embedding', False)
 
     print(f"\nLoading model from {args.model_path}")
     print(f"  model_name: {model_name}")
     print(f"  image_size: {image_size}, heatmap_size: {heatmap_size}")
-    print(f"  use_cnn_stem: {use_cnn_stem}, use_robot_classifier: {use_robot_classifier}, use_enhanced_3d: {use_enhanced_3d}")
+    print(f"  use_joint_embedding: {use_joint_embedding}")
     print(f"  keypoint_names ({len(keypoint_names)}): {keypoint_names}")
 
     # Skeleton connections (build dynamically based on number of keypoints)
@@ -261,9 +259,7 @@ def inference_single_image(args):
         dino_model_name=model_name,
         heatmap_size=(heatmap_size, heatmap_size),
         unfreeze_blocks=0,
-        use_cnn_stem=use_cnn_stem,
-        use_robot_classifier=use_robot_classifier,
-        use_enhanced_3d=use_enhanced_3d
+        use_joint_embedding=use_joint_embedding
     ).to(device)
 
     # Load checkpoint
@@ -316,19 +312,6 @@ def inference_single_image(args):
     pred_heatmaps = outputs["heatmaps_2d"]
     pred_kpts_3d = outputs["keypoints_3d"]
 
-    # Robot type prediction (optional)
-    robot_type_logits = outputs.get("robot_type", None)
-    robot_type_name = None
-    robot_confidence = None
-    robot_probs = None
-
-    if robot_type_logits is not None:
-        from model import ROBOT_TYPE_NAMES
-        robot_probs = torch.softmax(robot_type_logits, dim=-1)[0]
-        robot_type_idx = torch.argmax(robot_probs).item()
-        robot_type_name = ROBOT_TYPE_NAMES[robot_type_idx]
-        robot_confidence = robot_probs[robot_type_idx].item()
-
     # Extract keypoints
     pred_keypoints = get_keypoints_from_heatmaps(pred_heatmaps)[0]  # (N, 2)
 
@@ -347,16 +330,6 @@ def inference_single_image(args):
     print("\n" + "=" * 80)
     print("INFERENCE RESULTS")
     print("=" * 80)
-
-    if robot_type_name is not None:
-        from model import ROBOT_TYPE_NAMES
-        print(f"\nRobot Type Classification:")
-        print(f"  Predicted: {robot_type_name} (confidence: {robot_confidence*100:.2f}%)")
-        print(f"  All probabilities:")
-        for cls_name, prob in zip(ROBOT_TYPE_NAMES, robot_probs.cpu().numpy()):
-            print(f"    {cls_name:20s}: {prob*100:5.2f}%")
-    else:
-        print("\nRobot Type Classification: Disabled")
 
     print("\nPredicted Keypoints (original image coordinates):")
     for i, (name, kp) in enumerate(zip(keypoint_names, pred_keypoints_scaled)):
@@ -421,15 +394,6 @@ def inference_single_image(args):
         'model_path': str(args.model_path),
         'model_name': args.model_name
     }
-
-    # Add robot type if available
-    if robot_type_name is not None:
-        from model import ROBOT_TYPE_NAMES
-        results['robot_type'] = {
-            'predicted_class': robot_type_name,
-            'confidence': float(robot_confidence),
-            'all_probabilities': {cls: float(prob) for cls, prob in zip(ROBOT_TYPE_NAMES, robot_probs.cpu().numpy())}
-        }
 
     json_path = output_dir / f"{base_name}_results.json"
     with open(json_path, 'w') as f:

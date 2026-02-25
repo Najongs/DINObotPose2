@@ -53,25 +53,19 @@ class UnifiedPoseLoss(nn.Module):
     Multi-task loss for Pose Estimation:
     1. 2D Heatmap Loss (MSE)
     2. 3D Keypoint Lifting Loss (SmoothL1)
-    3. Robot Type Classification Loss (CrossEntropy) - optional
     """
     def __init__(
         self,
         heatmap_weight: float = 1.0,
         kp3d_weight: float = 10.0,  # 3D 좌표는 값의 범위가 작으므로 가중치를 높게 설정
-        robot_class_weight: float = 1.0,
-        heatmap_size: int = 512,  # Heatmap size for coordinate normalization
-        use_robot_classifier: bool = False
+        heatmap_size: int = 512,
     ):
         super().__init__()
         self.heatmap_weight = heatmap_weight
         self.kp3d_weight = kp3d_weight
-        self.robot_class_weight = robot_class_weight
         self.heatmap_size = heatmap_size
-        self.use_robot_classifier = use_robot_classifier
 
         self.heatmap_loss = nn.MSELoss()
-        self.robot_class_loss = nn.CrossEntropyLoss()
         self.eps = 1e-6  # Numerical stability
 
     def forward(self, pred_dict, gt_dict):
@@ -80,13 +74,11 @@ class UnifiedPoseLoss(nn.Module):
             pred_dict: {
                 'heatmaps_2d': (B, MAX_JOINTS, H, W),
                 'keypoints_3d': (B, MAX_JOINTS, 3),
-                'robot_type': (B, NUM_CLASSES) - optional
             }
             gt_dict: {
                 'heatmaps_2d': (B, MAX_JOINTS, H, W),
                 'keypoints_3d': (B, MAX_JOINTS, 3),
                 'valid_mask': (B, MAX_JOINTS) - bool mask,
-                'robot_type': (B,) - optional
             }
         """
         # Get valid mask
@@ -94,7 +86,6 @@ class UnifiedPoseLoss(nn.Module):
 
         # 1. 2D Heatmap Loss (2D 위치 정밀도) - with masking
         if valid_mask is not None:
-            # Apply mask: (B, MAX_JOINTS, H, W) * (B, MAX_JOINTS, 1, 1)
             mask_expanded = valid_mask.unsqueeze(-1).unsqueeze(-1).float()  # (B, MAX_JOINTS, 1, 1)
             heatmap_diff = (pred_dict['heatmaps_2d'] - gt_dict['heatmaps_2d']) ** 2
             heatmap_diff_masked = heatmap_diff * mask_expanded
@@ -107,7 +98,6 @@ class UnifiedPoseLoss(nn.Module):
         kp3d_gt = gt_dict['keypoints_3d']
 
         if valid_mask is not None:
-            # Apply mask: (B, MAX_JOINTS, 3) * (B, MAX_JOINTS, 1)
             mask_expanded = valid_mask.unsqueeze(-1).float()  # (B, MAX_JOINTS, 1)
             kp3d_diff = torch.nn.functional.smooth_l1_loss(
                 kp3d_pred, kp3d_gt, reduction='none'
@@ -119,25 +109,16 @@ class UnifiedPoseLoss(nn.Module):
                 kp3d_pred, kp3d_gt, reduction='mean'
             )
 
-        # 3. Robot Type Classification Loss (optional)
-        loss_robot_class = torch.tensor(0.0, device=loss_heatmap.device)
-        if self.use_robot_classifier and 'robot_type' in pred_dict and 'robot_type' in gt_dict:
-            robot_logits = pred_dict['robot_type']
-            robot_labels = gt_dict['robot_type']
-            loss_robot_class = self.robot_class_loss(robot_logits, robot_labels)
-
         # Total Loss (Weighted Sum)
         total_loss = (
             self.heatmap_weight * loss_heatmap +
-            self.kp3d_weight * loss_kp3d +
-            self.robot_class_weight * loss_robot_class
+            self.kp3d_weight * loss_kp3d
         )
 
         loss_dict = {
             'total': total_loss.item(),
             'heatmap': loss_heatmap.item(),
             'kp3d': loss_kp3d.item(),
-            'robot_class': loss_robot_class.item()
         }
 
         return total_loss, loss_dict
@@ -309,7 +290,6 @@ class Trainer:
             'total': [],
             'heatmap': [],
             'kp3d': [],
-            'robot_class': []
         }
 
         # Only show progress bar on main process
@@ -337,10 +317,6 @@ class Trainer:
                 'valid_mask': gt_valid_mask
             }
 
-            # Add robot type labels if available
-            if 'robot_type' in batch:
-                gt_dict['robot_type'] = batch['robot_type'].to(self.device)
-
             # Compute loss
             loss, loss_dict = self.criterion(pred_dict, gt_dict)
 
@@ -361,8 +337,6 @@ class Trainer:
                     'hm': f"{loss_dict['heatmap']:.6f}",
                     'kp3d': f"{loss_dict['kp3d']:.6f}"
                 }
-                if loss_dict.get('robot_class', 0.0) > 0:
-                    postfix['rc'] = f"{loss_dict['robot_class']:.6f}"
                 pbar.set_postfix(postfix)
 
                 # Log batch losses to wandb every N batches
@@ -374,8 +348,6 @@ class Trainer:
                             'batch/train_heatmap_loss': loss_dict['heatmap'],
                             'batch/train_kp3d_loss': loss_dict['kp3d']
                         }
-                        if loss_dict.get('robot_class', 0.0) > 0:
-                            batch_log['batch/train_robot_class_loss'] = loss_dict['robot_class']
                         wandb.log(batch_log, step=global_step)
                     except Exception:
                         pass  # Silently ignore batch logging errors
@@ -401,17 +373,12 @@ class Trainer:
             'total': [],
             'heatmap': [],
             'kp3d': [],
-            'robot_class': []
         }
 
         # Metrics collection
         all_kp_projs_est = []
         all_kp_projs_gt = []
         all_kp_pos_gt = []
-
-        # Robot classifier metrics
-        robot_correct = 0
-        robot_total = 0
 
         # Only show progress bar on main process
         if self.is_main_process:
@@ -436,19 +403,8 @@ class Trainer:
                 'valid_mask': gt_valid_mask
             }
 
-            # Add robot type labels if available
-            if 'robot_type' in batch:
-                gt_dict['robot_type'] = batch['robot_type'].to(self.device)
-
             # Compute loss
             _, loss_dict = self.criterion(pred_dict, gt_dict)
-
-            # Robot classifier accuracy
-            if 'robot_type' in pred_dict and 'robot_type' in batch:
-                robot_preds = pred_dict['robot_type'].argmax(dim=-1)
-                robot_labels = batch['robot_type'].to(self.device)
-                robot_correct += (robot_preds == robot_labels).sum().item()
-                robot_total += robot_labels.size(0)
 
             # Record losses
             for key, value in loss_dict.items():
@@ -488,18 +444,10 @@ class Trainer:
                     'hm': f"{loss_dict['heatmap']:.6f}",
                     'kp3d': f"{loss_dict['kp3d']:.6f}"
                 }
-                if loss_dict.get('robot_class', 0.0) > 0:
-                    postfix['rc'] = f"{loss_dict['robot_class']:.6f}"
-                if robot_total > 0:
-                    postfix['rc_acc'] = f"{robot_correct / robot_total:.2%}"
                 pbar.set_postfix(postfix)
 
         # Average losses
         avg_losses = {key: np.mean(values) if values else 0.0 for key, values in epoch_losses.items()}
-
-        # Add robot classifier accuracy
-        if robot_total > 0:
-            avg_losses['robot_class_acc'] = robot_correct / robot_total
 
         # Synchronize basic losses across processes in distributed training FIRST
         # This prevents NCCL timeout when rank 0 computes expensive metrics
@@ -615,7 +563,6 @@ class Trainer:
                         'train/total_loss': train_losses['total'],
                         'train/heatmap_loss': train_losses['heatmap'],
                         'train/kp3d_loss': train_losses['kp3d'],
-                        'train/robot_class_loss': train_losses.get('robot_class', 0.0),
                         'learning_rate': current_lr,
                         'best_val_loss': self.best_val_loss
                     }
@@ -632,22 +579,8 @@ class Trainer:
                 epoch_time = time.time() - epoch_start
                 print(f"\nEpoch {epoch} Summary:")
 
-                # Build train loss string
-                train_loss_str = f"  Train Loss: {train_losses['total']:.6f} (hm: {train_losses['heatmap']:.6f}, kp3d: {train_losses['kp3d']:.6f}"
-                if 'robot_class' in train_losses:
-                    train_loss_str += f", rc: {train_losses['robot_class']:.6f}"
-                train_loss_str += ")"
-                print(train_loss_str)
-
-                # Build val loss string
-                val_loss_str = f"  Val Loss:   {val_losses['total']:.6f} (hm: {val_losses['heatmap']:.6f}, kp3d: {val_losses['kp3d']:.6f}"
-                if 'robot_class' in val_losses:
-                    val_loss_str += f", rc: {val_losses['robot_class']:.6f}"
-                val_loss_str += ")"
-                print(val_loss_str)
-
-                if 'robot_class_acc' in val_losses:
-                    print(f"  Val Robot Classifier Acc: {val_losses['robot_class_acc']:.2%}")
+                print(f"  Train Loss: {train_losses['total']:.6f} (hm: {train_losses['heatmap']:.6f}, kp3d: {train_losses['kp3d']:.6f})")
+                print(f"  Val Loss:   {val_losses['total']:.6f} (hm: {val_losses['heatmap']:.6f}, kp3d: {val_losses['kp3d']:.6f})")
                 if 'val_pck_auc' in val_losses:
                     print(f"  Val PCK AUC: {val_losses['val_pck_auc']:.4f}, ADD AUC: {val_losses['val_add_auc']:.4f}")
                     print(f"  Val ADD Mean: {val_losses['val_add_mean_mm']:.2f}mm, PnP Succ: {val_losses['val_pnp_success_rate']:.2%}")
@@ -910,9 +843,7 @@ def main(args):
         dino_model_name=args.model_name,
         heatmap_size=(args.heatmap_size, args.heatmap_size),
         unfreeze_blocks=args.unfreeze_blocks,
-        use_cnn_stem=args.use_cnn_stem,
-        use_robot_classifier=args.use_robot_classifier,
-        use_enhanced_3d=args.use_enhanced_3d
+        use_joint_embedding=args.use_joint_embedding
     ).to(device)
 
     # Wrap model with DistributedDataParallel for multi-GPU training
@@ -928,8 +859,7 @@ def main(args):
 
     if is_main_process:
         print(f"Model: {args.model_name}")
-        print(f"CNN Stem: {'Enabled' if args.use_cnn_stem else 'Disabled (ViT-only)'}")
-        print(f"Robot Classifier: {'Enabled' if args.use_robot_classifier else 'Disabled'}")
+        print(f"Joint Embedding: {'Enabled' if args.use_joint_embedding else 'Disabled'}")
         print(f"Fine-tuning: Partial (Last {args.unfreeze_blocks} blocks)")
 
         model_to_count = model.module if is_distributed else model
@@ -940,9 +870,7 @@ def main(args):
     criterion = UnifiedPoseLoss(
         heatmap_weight=args.heatmap_weight,
         kp3d_weight=args.kp3d_weight,
-        robot_class_weight=args.robot_class_weight,
         heatmap_size=args.heatmap_size,
-        use_robot_classifier=args.use_robot_classifier
     )
 
     # Optimizer
@@ -998,7 +926,7 @@ def main(args):
         'image_size': args.image_size,
         'heatmap_size': args.heatmap_size,
         'unfreeze_blocks': args.unfreeze_blocks,
-        'use_cnn_stem': args.use_cnn_stem,
+        'use_joint_embedding': args.use_joint_embedding,
         'batch_size': args.batch_size,
         'epochs': args.epochs,
         'optimizer': args.optimizer,
@@ -1008,9 +936,6 @@ def main(args):
         'scheduler': args.scheduler,
         'heatmap_weight': args.heatmap_weight,
         'kp3d_weight': args.kp3d_weight,
-        'robot_class_weight': args.robot_class_weight,
-        'use_robot_classifier': args.use_robot_classifier,
-        'use_enhanced_3d': args.use_enhanced_3d,
         'keypoint_names': keypoint_names,
         'wandb_project': args.wandb_project,
         'wandb_run_name': args.wandb_run_name
@@ -1074,14 +999,8 @@ if __name__ == '__main__':
                         help='Output heatmap size')
     parser.add_argument('--unfreeze-blocks', type=int, default=2,
                         help='Number of backbone blocks to unfreeze')
-    parser.add_argument('--use-cnn-stem', action='store_true', default=True,
-                        help='Use CNN stem for skip connections (default: True)')
-    parser.add_argument('--no-cnn-stem', action='store_false', dest='use_cnn_stem',
-                        help='Disable CNN stem and use ViT-only decoder')
-    parser.add_argument('--use-robot-classifier', action='store_true', default=False,
-                        help='Enable robot type classification head')
-    parser.add_argument('--use-enhanced-3d', action='store_true', default=False,
-                        help='Use EnhancedKeypoint3DHead with joint embeddings and deeper transformer')
+    parser.add_argument('--use-joint-embedding', action='store_true', default=False,
+                        help='Enable joint identity embeddings in 3D head for kinematic constraint learning')
 
     # Training
     parser.add_argument('--epochs', type=int, default=100,
@@ -1116,9 +1035,6 @@ if __name__ == '__main__':
                         help='Weight for heatmap loss')
     parser.add_argument('--kp3d-weight', type=float, default=10.0,
                         help='Weight for 3D keypoint loss')
-    parser.add_argument('--robot-class-weight', type=float, default=1.0,
-                        help='Weight for robot classification loss')
-
     # Output
     parser.add_argument('--output-dir', type=str, default='./outputs',
                         help='Output directory for checkpoints and logs')

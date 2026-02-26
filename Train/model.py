@@ -285,33 +285,32 @@ class Keypoint3DHead(nn.Module):
         # Extract 2D keypoint locations from heatmaps with learnable temperature
         uv_heatmap = soft_argmax_2d(predicted_heatmaps, self.temperature)  # (B, NJ, 2) in heatmap pixels
 
-        # Normalize 2D coords to [-1, 1] for feature input
+        # Normalize 2D coords to [-1, 1] for feature input (in-place 회피)
         hm_h, hm_w = predicted_heatmaps.shape[2], predicted_heatmaps.shape[3]
-        uv_normalized = uv_heatmap.clone()
-        uv_normalized[:, :, 0] = (uv_normalized[:, :, 0] / hm_w) * 2.0 - 1.0
-        uv_normalized[:, :, 1] = (uv_normalized[:, :, 1] / hm_h) * 2.0 - 1.0  # (B, NJ, 2)
+        uv_norm_x = (uv_heatmap[:, :, 0] / hm_w) * 2.0 - 1.0
+        uv_norm_y = (uv_heatmap[:, :, 1] / hm_h) * 2.0 - 1.0
+        uv_normalized = torch.stack([uv_norm_x, uv_norm_y], dim=-1)  # (B, NJ, 2)
 
-        # ROIAlign feature extraction (more efficient than spatial softmax pooling)
-        # Convert keypoint locations to RoI boxes for ROIAlign
-        # Scale keypoint coords from heatmap space to feature map space
+        # Scale keypoint coords from heatmap space to feature map space (ROIAlign용)
         scale_x = w / hm_w
         scale_y = h / hm_h
-        uv_feat = uv_heatmap.clone()
-        uv_feat[:, :, 0] = uv_feat[:, :, 0] * scale_x
-        uv_feat[:, :, 1] = uv_feat[:, :, 1] * scale_y
+        uv_feat = torch.stack([uv_heatmap[:, :, 0] * scale_x,
+                               uv_heatmap[:, :, 1] * scale_y], dim=-1)  # (B, NJ, 2)
 
-        # Create RoI boxes: [batch_idx, x1, y1, x2, y2]
-        roi_size = 7  # RoI size around each keypoint
-        rois = []
-        for b_idx in range(b):
-            for j_idx in range(self.num_joints):
-                cx, cy = uv_feat[b_idx, j_idx]
-                x1 = cx - roi_size / 2
-                y1 = cy - roi_size / 2
-                x2 = cx + roi_size / 2
-                y2 = cy + roi_size / 2
-                rois.append([b_idx, x1, y1, x2, y2])
-        rois = torch.tensor(rois, device=feat_map.device, dtype=torch.float32)
+        # Create RoI boxes: [batch_idx, x1, y1, x2, y2] — 벡터화로 Python loop 제거
+        # ViT patch size=14 → 512px input → feature map ~36x36
+        # roi_size=2: keypoint당 좁은 영역만 추출, 인접 keypoint 겹침 방지
+        roi_size = 2
+        batch_ids = torch.arange(b, device=feat_map.device, dtype=torch.float32)  # (B,)
+        batch_ids = batch_ids.unsqueeze(1).expand(b, self.num_joints)  # (B, NJ)
+        cx = uv_feat[:, :, 0]  # (B, NJ)
+        cy = uv_feat[:, :, 1]  # (B, NJ)
+        x1 = cx - roi_size / 2
+        y1 = cy - roi_size / 2
+        x2 = cx + roi_size / 2
+        y2 = cy + roi_size / 2
+        # Stack: (B*NJ, 5) — detach box coords (ROIAlign은 box 위치에 대해 미분불가)
+        rois = torch.stack([batch_ids, x1, y1, x2, y2], dim=-1).reshape(-1, 5).detach()
 
         # ROIAlign: extract 3x3 features for each keypoint
         roi_features = roi_align(feat_map, rois, output_size=(3, 3), spatial_scale=1.0)  # (B*NJ, D, 3, 3)
@@ -615,31 +614,25 @@ class JointAngleHead(nn.Module):
         # Extract 2D keypoint locations from heatmaps with learnable temperature
         uv_heatmap = soft_argmax_2d(predicted_heatmaps, self.temperature)  # (B, NJ, 2)
 
-        # Normalize 2D coords to [-1, 1]
+        # Normalize 2D coords to [-1, 1] (in-place 회피)
         hm_h, hm_w = predicted_heatmaps.shape[2], predicted_heatmaps.shape[3]
-        uv_normalized = uv_heatmap.clone()
-        uv_normalized[:, :, 0] = (uv_normalized[:, :, 0] / hm_w) * 2.0 - 1.0
-        uv_normalized[:, :, 1] = (uv_normalized[:, :, 1] / hm_h) * 2.0 - 1.0
+        uv_norm_x = (uv_heatmap[:, :, 0] / hm_w) * 2.0 - 1.0
+        uv_norm_y = (uv_heatmap[:, :, 1] / hm_h) * 2.0 - 1.0
+        uv_normalized = torch.stack([uv_norm_x, uv_norm_y], dim=-1)  # (B, NJ, 2)
 
-        # ROIAlign feature extraction (same as Keypoint3DHead)
+        # Scale keypoint coords from heatmap space to feature map space (ROIAlign용)
         scale_x = w / hm_w
         scale_y = h / hm_h
-        uv_feat = uv_heatmap.clone()
-        uv_feat[:, :, 0] = uv_feat[:, :, 0] * scale_x
-        uv_feat[:, :, 1] = uv_feat[:, :, 1] * scale_y
+        uv_feat = torch.stack([uv_heatmap[:, :, 0] * scale_x,
+                               uv_heatmap[:, :, 1] * scale_y], dim=-1)  # (B, NJ, 2)
 
-        # Create RoI boxes
-        roi_size = 7
-        rois = []
-        for b_idx in range(b):
-            for j_idx in range(self.num_joints):
-                cx, cy = uv_feat[b_idx, j_idx]
-                x1 = cx - roi_size / 2
-                y1 = cy - roi_size / 2
-                x2 = cx + roi_size / 2
-                y2 = cy + roi_size / 2
-                rois.append([b_idx, x1, y1, x2, y2])
-        rois = torch.tensor(rois, device=feat_map.device, dtype=torch.float32)
+        # Create RoI boxes — 벡터화 (roi_size=2: keypoint 겹침 방지)
+        roi_size = 2
+        batch_ids = torch.arange(b, device=feat_map.device, dtype=torch.float32).unsqueeze(1).expand(b, self.num_joints)
+        cx = uv_feat[:, :, 0]
+        cy = uv_feat[:, :, 1]
+        rois = torch.stack([batch_ids, cx - roi_size/2, cy - roi_size/2,
+                            cx + roi_size/2, cy + roi_size/2], dim=-1).reshape(-1, 5).detach()
 
         # ROIAlign + pooling
         roi_features = roi_align(feat_map, rois, output_size=(3, 3), spatial_scale=1.0)

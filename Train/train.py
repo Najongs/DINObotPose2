@@ -158,13 +158,18 @@ class UnifiedPoseLoss(nn.Module):
         self.use_adaptive_weighting = use_adaptive_weighting
         self.pnp_failure_penalty_weight = pnp_failure_penalty_weight
 
-        # Select loss function based on type
+        # Heatmap loss: 항상 MSE 사용 (값 범위 0~1, Gaussian GT와 MSE가 자연스러움)
+        self.heatmap_loss_fn = nn.MSELoss(reduction='none')
+
+        # 3D / angle loss: loss_type 인수에 따라 선택
+        # SmoothL1(beta=0.01): 3D 오차 수 cm 기준, 1cm 이상이면 L1(robust) 전환
+        # beta=1.0(구버전)은 오차 1m 기준이라 수 cm 오차에서 항상 L2만 작동했음
         if loss_type == 'mse':
             self.loss_fn = nn.MSELoss(reduction='none')
         elif loss_type == 'l1':
             self.loss_fn = nn.L1Loss(reduction='none')
         elif loss_type == 'smoothl1':
-            self.loss_fn = nn.SmoothL1Loss(reduction='none', beta=1.0)
+            self.loss_fn = nn.SmoothL1Loss(reduction='none', beta=0.01)
         else:
             raise ValueError(f"Unknown loss type: {loss_type}")
 
@@ -191,14 +196,14 @@ class UnifiedPoseLoss(nn.Module):
         # Get valid mask
         valid_mask = gt_dict.get('valid_mask', None)  # (B, MAX_JOINTS)
 
-        # 1. 2D Heatmap Loss (2D 위치 정밀도) - with masking
+        # 1. 2D Heatmap Loss (항상 MSE: Gaussian GT와 자연스러운 조합)
         if valid_mask is not None:
             mask_expanded = valid_mask.unsqueeze(-1).unsqueeze(-1).float()  # (B, MAX_JOINTS, 1, 1)
-            heatmap_diff = self.loss_fn(pred_dict['heatmaps_2d'], gt_dict['heatmaps_2d'])
+            heatmap_diff = self.heatmap_loss_fn(pred_dict['heatmaps_2d'], gt_dict['heatmaps_2d'])
             heatmap_diff_masked = heatmap_diff * mask_expanded
             loss_heatmap = heatmap_diff_masked.sum() / (mask_expanded.sum() + self.eps)
         else:
-            heatmap_diff = self.loss_fn(pred_dict['heatmaps_2d'], gt_dict['heatmaps_2d'])
+            heatmap_diff = self.heatmap_loss_fn(pred_dict['heatmaps_2d'], gt_dict['heatmaps_2d'])
             loss_heatmap = heatmap_diff.mean()
 
         # 2. 3D Keypoint Loss - with masking
@@ -215,13 +220,22 @@ class UnifiedPoseLoss(nn.Module):
             loss_kp3d = kp3d_diff.mean()
 
         # Total Loss with Adaptive Weighting or Fixed Weights
+        # kp3d_weight=0이면 (joint_angle 모드 등) kp3d loss를 total에서 완전히 제외
+        use_kp3d = self.kp3d_weight > 0
+
         if self.use_adaptive_weighting:
             # Uncertainty-based weighting: loss / (2 * exp(log_sigma)) + log_sigma
-            # This automatically balances losses based on learned task uncertainty
-            total_loss = (
-                loss_heatmap / (2 * torch.exp(self.log_sigma_heatmap)) + self.log_sigma_heatmap +
-                loss_kp3d / (2 * torch.exp(self.log_sigma_3d)) + self.log_sigma_3d
-            )
+            # joint_angle 모드에서는 kp3d_weight=0이므로 kp3d 항 제외
+            # (robot frame vs camera frame 비교가 되는 잘못된 gradient 방지)
+            if use_kp3d:
+                total_loss = (
+                    loss_heatmap / (2 * torch.exp(self.log_sigma_heatmap)) + self.log_sigma_heatmap +
+                    loss_kp3d / (2 * torch.exp(self.log_sigma_3d)) + self.log_sigma_3d
+                )
+            else:
+                total_loss = (
+                    loss_heatmap / (2 * torch.exp(self.log_sigma_heatmap)) + self.log_sigma_heatmap
+                )
             loss_dict = {
                 'total': total_loss.item(),
                 'heatmap': loss_heatmap.item(),
@@ -233,7 +247,7 @@ class UnifiedPoseLoss(nn.Module):
             # Fixed weighting
             total_loss = (
                 self.heatmap_weight * loss_heatmap +
-                self.kp3d_weight * loss_kp3d
+                self.kp3d_weight * loss_kp3d  # kp3d_weight=0이면 자동으로 0
             )
             loss_dict = {
                 'total': total_loss.item(),

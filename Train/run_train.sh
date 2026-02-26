@@ -28,6 +28,9 @@ DEPTH_ONLY_3D=False  # Predict only depth (z), recover x,y from 2D heatmap + cam
 JOINT_ANGLE_3D=True  # Predict joint angles → FK → robot-frame 3D keypoints
 
 # Joint angle mode loss weights
+# angle loss: 라디안 단위 (범위 ~0~6), 3D loss: 미터 단위 (범위 ~0.01~0.5)
+# FK_3D는 robot frame 기준이므로 실제 성능 지표(camera frame ADD)와 좌표계가 다름
+# → angle loss로 자세 추정 → FK_3D로 구조적 일관성 강제 순서로 학습
 ANGLE_WEIGHT=1.0     # Joint angle MSE loss weight
 FK_3D_WEIGHT=10.0    # FK 3D keypoint MSE loss weight (robot frame)
 

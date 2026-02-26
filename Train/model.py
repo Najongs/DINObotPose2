@@ -3,6 +3,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers import AutoModel, SiglipVisionModel
+from torchvision.ops import roi_align
 
 FEATURE_DIM = 512
 NUM_JOINTS = 7  # DO NOT CHANGE: This value is intentionally set to 7.
@@ -18,7 +19,7 @@ def soft_argmax_2d(heatmaps, temperature=10.0):
     Differentiable soft-argmax to extract (u, v) from heatmaps.
     Args:
         heatmaps: (B, N, H, W)
-        temperature: scaling factor for softmax sharpness
+        temperature: scaling factor for softmax sharpness (float or Tensor)
     Returns:
         (B, N, 2) [x, y] coordinates in heatmap pixel space
     """
@@ -29,6 +30,11 @@ def soft_argmax_2d(heatmaps, temperature=10.0):
     y_coords = torch.arange(H, device=device, dtype=torch.float32)
 
     heatmaps_flat = heatmaps.reshape(B, N, -1)
+
+    # Support both fixed temperature and learnable parameter
+    if isinstance(temperature, torch.Tensor):
+        temperature = temperature.clamp(min=0.1, max=50.0)  # Prevent extreme values
+
     weights = F.softmax(heatmaps_flat * temperature, dim=-1)
     weights = weights.reshape(B, N, H, W)
 
@@ -80,6 +86,25 @@ class DINOv3Backbone(nn.Module):
             patch_tokens = tokens[:, 1 + num_reg :, :]
         return patch_tokens
 
+class AdaptiveNorm2d(nn.Module):
+    """Adaptive normalization mixing GroupNorm and LayerNorm for sim-to-real robustness"""
+    def __init__(self, num_channels, num_groups=32):
+        super().__init__()
+        self.gn = nn.GroupNorm(num_groups, num_channels)
+        self.ln = nn.LayerNorm(num_channels)
+        # Learnable mixing coefficient
+        self.alpha = nn.Parameter(torch.tensor(0.5))
+
+    def forward(self, x):
+        # x: (B, C, H, W)
+        gn_out = self.gn(x)
+        # LayerNorm over channels
+        ln_out = self.ln(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+        # Mix with learnable alpha (clamped to [0, 1])
+        alpha = torch.sigmoid(self.alpha)
+        return alpha * gn_out + (1 - alpha) * ln_out
+
+
 class TokenFuser(nn.Module):
     def __init__(self, in_channels, out_channels):
         super().__init__()
@@ -87,13 +112,13 @@ class TokenFuser(nn.Module):
         self.projection = nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=True)
         self.refine_blocks = nn.Sequential(
             nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, bias=False),
-            nn.GroupNorm(32, out_channels),
+            AdaptiveNorm2d(out_channels, num_groups=32),
             nn.GELU(),
             nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, bias=False),
-            nn.GroupNorm(32, out_channels)
+            AdaptiveNorm2d(out_channels, num_groups=32)
         )
         self.residual_conv = nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=True)
-        
+
     def forward(self, x):
         projected = self.projection(x)
         refined = self.refine_blocks(projected)
@@ -106,27 +131,34 @@ class ViTKeypointHead(nn.Module):
         self.heatmap_size = heatmap_size
         self.token_fuser = TokenFuser(input_dim, 256)
 
-        # ViT-only decoder (GroupNorm for sim-to-real robustness)
+        # ViT-only decoder with adaptive normalization
         self.decoder_block1 = nn.Sequential(
             nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True),
             nn.Conv2d(256, 128, kernel_size=3, padding=1, bias=False),
-            nn.GroupNorm(32, 128),
+            AdaptiveNorm2d(128, num_groups=32),
             nn.GELU()
         )
         self.decoder_block2 = nn.Sequential(
             nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True),
             nn.Conv2d(128, 64, kernel_size=3, padding=1, bias=False),
-            nn.GroupNorm(16, 64),
+            AdaptiveNorm2d(64, num_groups=16),
             nn.GELU()
         )
         self.decoder_block3 = nn.Sequential(
             nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True),
             nn.Conv2d(64, 32, kernel_size=3, padding=1, bias=False),
-            nn.GroupNorm(8, 32),
+            AdaptiveNorm2d(32, num_groups=8),
             nn.GELU()
         )
 
         self.heatmap_predictor = nn.Conv2d(32, num_joints, kernel_size=3, padding=1)
+
+        # Learned upsampling with transposed convolution (better than bilinear)
+        # From 32x32 (after 3 decoder blocks) to 512x512 requires 4x upsampling
+        self.final_upsample = nn.Sequential(
+            nn.ConvTranspose2d(num_joints, num_joints, kernel_size=4, stride=2, padding=1, bias=False),
+            nn.ConvTranspose2d(num_joints, num_joints, kernel_size=4, stride=2, padding=1, bias=False)
+        )
 
     def forward(self, dino_features):
         b, n, d = dino_features.shape
@@ -144,7 +176,14 @@ class ViTKeypointHead(nn.Module):
 
         heatmaps = self.heatmap_predictor(x)
 
-        return F.interpolate(heatmaps, size=self.heatmap_size, mode='bilinear', align_corners=False)
+        # Use learned upsampling instead of bilinear interpolation
+        heatmaps = self.final_upsample(heatmaps)
+
+        # Final resize to exact target size if needed
+        if heatmaps.shape[2:] != self.heatmap_size:
+            heatmaps = F.interpolate(heatmaps, size=self.heatmap_size, mode='bilinear', align_corners=False)
+
+        return heatmaps
 
 class Keypoint3DHead(nn.Module):
     """
@@ -182,6 +221,9 @@ class Keypoint3DHead(nn.Module):
         self.register_buffer('mean_pose',
                              torch.tensor(self.MEAN_POSE, dtype=torch.float32))  # (NJ, 3)
 
+        # Learnable temperature for soft-argmax (initialized to 10.0)
+        self.temperature = nn.Parameter(torch.tensor(10.0))
+
         # 1. Per-joint feature refinement
         # Input: visual feature (input_dim) + normalized 2D coords (2)
         self.joint_feature_net = nn.Sequential(
@@ -194,7 +236,7 @@ class Keypoint3DHead(nn.Module):
         if use_joint_embedding:
             self.joint_embedding = nn.Embedding(num_joints, self.hidden_dim)
 
-        # 3. Self-attention for kinematic constraint learning
+        # 3. Self-attention for kinematic constraint learning (reduced from 4 to 2 layers)
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=self.hidden_dim,
             nhead=8,
@@ -203,7 +245,7 @@ class Keypoint3DHead(nn.Module):
             activation='gelu',
             batch_first=True
         )
-        self.joint_relation_net = nn.TransformerEncoder(encoder_layer, num_layers=4)
+        self.joint_relation_net = nn.TransformerEncoder(encoder_layer, num_layers=2)
 
         # 4. Output head depends on mode
         if mode == MODE_DEPTH_ONLY:
@@ -240,8 +282,8 @@ class Keypoint3DHead(nn.Module):
 
         feat_map = dino_features.permute(0, 2, 1).reshape(b, d, h, w)
 
-        # Extract 2D keypoint locations from heatmaps
-        uv_heatmap = soft_argmax_2d(predicted_heatmaps)  # (B, NJ, 2) in heatmap pixels
+        # Extract 2D keypoint locations from heatmaps with learnable temperature
+        uv_heatmap = soft_argmax_2d(predicted_heatmaps, self.temperature)  # (B, NJ, 2) in heatmap pixels
 
         # Normalize 2D coords to [-1, 1] for feature input
         hm_h, hm_w = predicted_heatmaps.shape[2], predicted_heatmaps.shape[3]
@@ -249,15 +291,34 @@ class Keypoint3DHead(nn.Module):
         uv_normalized[:, :, 0] = (uv_normalized[:, :, 0] / hm_w) * 2.0 - 1.0
         uv_normalized[:, :, 1] = (uv_normalized[:, :, 1] / hm_h) * 2.0 - 1.0  # (B, NJ, 2)
 
-        # Spatial Softmax Pooling for visual features
-        weights = F.interpolate(predicted_heatmaps, size=(h, w), mode='bilinear', align_corners=False)
-        weights = torch.clamp(weights, min=0)
+        # ROIAlign feature extraction (more efficient than spatial softmax pooling)
+        # Convert keypoint locations to RoI boxes for ROIAlign
+        # Scale keypoint coords from heatmap space to feature map space
+        scale_x = w / hm_w
+        scale_y = h / hm_h
+        uv_feat = uv_heatmap.clone()
+        uv_feat[:, :, 0] = uv_feat[:, :, 0] * scale_x
+        uv_feat[:, :, 1] = uv_feat[:, :, 1] * scale_y
 
-        weights_flat = weights.reshape(b, self.num_joints, -1)
-        weights_norm = F.softmax(weights_flat / 0.1, dim=-1)
-        weights_norm = weights_norm.reshape(b, self.num_joints, h, w)
+        # Create RoI boxes: [batch_idx, x1, y1, x2, y2]
+        roi_size = 7  # RoI size around each keypoint
+        rois = []
+        for b_idx in range(b):
+            for j_idx in range(self.num_joints):
+                cx, cy = uv_feat[b_idx, j_idx]
+                x1 = cx - roi_size / 2
+                y1 = cy - roi_size / 2
+                x2 = cx + roi_size / 2
+                y2 = cy + roi_size / 2
+                rois.append([b_idx, x1, y1, x2, y2])
+        rois = torch.tensor(rois, device=feat_map.device, dtype=torch.float32)
 
-        joint_features = torch.einsum('bdhw,bjhw->bjd', feat_map, weights_norm)  # (B, NJ, D)
+        # ROIAlign: extract 3x3 features for each keypoint
+        roi_features = roi_align(feat_map, rois, output_size=(3, 3), spatial_scale=1.0)  # (B*NJ, D, 3, 3)
+
+        # Global average pooling over spatial dimensions
+        joint_features = roi_features.mean(dim=[2, 3])  # (B*NJ, D)
+        joint_features = joint_features.view(b, self.num_joints, d)  # (B, NJ, D)
 
         # Concatenate explicit 2D coordinates to visual features
         joint_features = torch.cat([joint_features, uv_normalized], dim=-1)  # (B, NJ, D+2)
@@ -506,6 +567,9 @@ class JointAngleHead(nn.Module):
         self.register_buffer('joint_mid', (limits[:, 0] + limits[:, 1]) / 2)  # (7,)
         self.register_buffer('joint_range', (limits[:, 1] - limits[:, 0]) / 2)  # (7,)
 
+        # Learnable temperature for soft-argmax
+        self.temperature = nn.Parameter(torch.tensor(10.0))
+
         # 1. Per-joint feature refinement
         # Input: visual feature (input_dim) + normalized 2D coords (2)
         self.joint_feature_net = nn.Sequential(
@@ -514,7 +578,7 @@ class JointAngleHead(nn.Module):
             nn.LayerNorm(self.hidden_dim)
         )
 
-        # 2. Self-attention for kinematic constraint learning
+        # 2. Self-attention for kinematic constraint learning (reduced from 4 to 2 layers)
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=self.hidden_dim,
             nhead=8,
@@ -523,14 +587,15 @@ class JointAngleHead(nn.Module):
             activation='gelu',
             batch_first=True
         )
-        self.joint_relation_net = nn.TransformerEncoder(encoder_layer, num_layers=4)
+        self.joint_relation_net = nn.TransformerEncoder(encoder_layer, num_layers=2)
 
-        # 3. Predict joint angles (7 angles from 7 keypoint features)
+        # 3. Per-joint angle prediction (improved from global MLP)
+        # Each joint predicts its own angle based on contextual features
         self.angle_predictor = nn.Sequential(
-            nn.Linear(self.hidden_dim * num_joints, 256),
+            nn.Linear(self.hidden_dim, 128),
             nn.GELU(),
-            nn.LayerNorm(256),
-            nn.Linear(256, num_angles)
+            nn.LayerNorm(128),
+            nn.Linear(128, 1)  # Predict 1 angle per joint
         )
 
     def forward(self, dino_features, predicted_heatmaps):
@@ -547,8 +612,8 @@ class JointAngleHead(nn.Module):
 
         feat_map = dino_features.permute(0, 2, 1).reshape(b, d, h, w)
 
-        # Extract 2D keypoint locations from heatmaps
-        uv_heatmap = soft_argmax_2d(predicted_heatmaps)  # (B, NJ, 2)
+        # Extract 2D keypoint locations from heatmaps with learnable temperature
+        uv_heatmap = soft_argmax_2d(predicted_heatmaps, self.temperature)  # (B, NJ, 2)
 
         # Normalize 2D coords to [-1, 1]
         hm_h, hm_w = predicted_heatmaps.shape[2], predicted_heatmaps.shape[3]
@@ -556,14 +621,30 @@ class JointAngleHead(nn.Module):
         uv_normalized[:, :, 0] = (uv_normalized[:, :, 0] / hm_w) * 2.0 - 1.0
         uv_normalized[:, :, 1] = (uv_normalized[:, :, 1] / hm_h) * 2.0 - 1.0
 
-        # Spatial Softmax Pooling for visual features
-        weights = F.interpolate(predicted_heatmaps, size=(h, w), mode='bilinear', align_corners=False)
-        weights = torch.clamp(weights, min=0)
-        weights_flat = weights.reshape(b, self.num_joints, -1)
-        weights_norm = F.softmax(weights_flat / 0.1, dim=-1)
-        weights_norm = weights_norm.reshape(b, self.num_joints, h, w)
+        # ROIAlign feature extraction (same as Keypoint3DHead)
+        scale_x = w / hm_w
+        scale_y = h / hm_h
+        uv_feat = uv_heatmap.clone()
+        uv_feat[:, :, 0] = uv_feat[:, :, 0] * scale_x
+        uv_feat[:, :, 1] = uv_feat[:, :, 1] * scale_y
 
-        joint_features = torch.einsum('bdhw,bjhw->bjd', feat_map, weights_norm)  # (B, NJ, D)
+        # Create RoI boxes
+        roi_size = 7
+        rois = []
+        for b_idx in range(b):
+            for j_idx in range(self.num_joints):
+                cx, cy = uv_feat[b_idx, j_idx]
+                x1 = cx - roi_size / 2
+                y1 = cy - roi_size / 2
+                x2 = cx + roi_size / 2
+                y2 = cy + roi_size / 2
+                rois.append([b_idx, x1, y1, x2, y2])
+        rois = torch.tensor(rois, device=feat_map.device, dtype=torch.float32)
+
+        # ROIAlign + pooling
+        roi_features = roi_align(feat_map, rois, output_size=(3, 3), spatial_scale=1.0)
+        joint_features = roi_features.mean(dim=[2, 3])
+        joint_features = joint_features.view(b, self.num_joints, d)
 
         # Concatenate 2D coordinates
         joint_features = torch.cat([joint_features, uv_normalized], dim=-1)  # (B, NJ, D+2)
@@ -572,9 +653,8 @@ class JointAngleHead(nn.Module):
         refined = self.joint_feature_net(joint_features)  # (B, NJ, 256)
         related = self.joint_relation_net(refined)  # (B, NJ, 256)
 
-        # Flatten and predict angles
-        flat_features = related.reshape(b, -1)  # (B, NJ * 256)
-        raw_angles = self.angle_predictor(flat_features)  # (B, 7)
+        # Per-joint angle prediction
+        raw_angles = self.angle_predictor(related).squeeze(-1)  # (B, NJ)
 
         # Apply joint limits via tanh scaling: mid + tanh(raw) * range
         joint_angles = self.joint_mid.unsqueeze(0) + torch.tanh(raw_angles) * self.joint_range.unsqueeze(0)

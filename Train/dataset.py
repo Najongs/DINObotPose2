@@ -496,6 +496,7 @@ def create_dataloaders(
     num_workers: int = 4,
     image_size: Tuple[int, int] = (512, 512),
     heatmap_size: Tuple[int, int] = (512, 512),
+    val_split: float = 1.0,
     **kwargs
 ) -> Tuple[torch.utils.data.DataLoader, torch.utils.data.DataLoader]:
     """
@@ -509,6 +510,7 @@ def create_dataloaders(
         num_workers: 데이터 로딩 워커 수
         image_size: 입력 이미지 크기
         heatmap_size: 출력 heatmap 크기
+        val_split: 검증 데이터 사용 비율 (0.0~1.0, default=1.0 for all data)
 
     Returns:
         train_loader, val_loader
@@ -522,7 +524,7 @@ def create_dataloaders(
         **kwargs
     )
 
-    val_dataset = PoseEstimationDataset(
+    val_dataset_full = PoseEstimationDataset(
         data_dir=val_dir,
         keypoint_names=keypoint_names,
         image_size=image_size,
@@ -530,6 +532,17 @@ def create_dataloaders(
         augment=False,
         **kwargs
     )
+
+    # Use only a fraction of validation data if val_split < 1.0
+    if val_split < 1.0:
+        val_size = int(len(val_dataset_full) * val_split)
+        unused_size = len(val_dataset_full) - val_size
+        generator = torch.Generator().manual_seed(42)
+        val_dataset, _ = torch.utils.data.random_split(
+            val_dataset_full, [val_size, unused_size], generator=generator
+        )
+    else:
+        val_dataset = val_dataset_full
 
     train_loader = torch.utils.data.DataLoader(
         train_dataset,

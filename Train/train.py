@@ -6,7 +6,6 @@ DREAM 학습 방식을 참고한 학습 코드
 import argparse
 import os
 import time
-import json
 import pickle
 import random
 from pathlib import Path
@@ -23,6 +22,7 @@ import torch.distributed as dist
 from tqdm import tqdm
 import yaml
 import wandb
+import cv2
 
 from model import (DINOv3PoseEstimator, MODE_DIRECT, MODE_DEPTH_ONLY,
                     MODE_JOINT_ANGLE, panda_forward_kinematics)
@@ -32,7 +32,53 @@ import sys
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../DREAM')))
 import dream
 from dream import analysis as dream_analysis
-from scipy.spatial.transform import Rotation
+
+def solve_pnp_epnp(object_points, image_points, camera_matrix):
+    """
+    Solve PnP using EPnP algorithm (faster and more stable than iterative).
+
+    Args:
+        object_points: (N, 3) 3D points in object/robot frame
+        image_points: (N, 2) 2D points in image coordinates
+        camera_matrix: (3, 3) camera intrinsic matrix
+
+    Returns:
+        success (bool): Whether PnP succeeded
+        R (3, 3): Rotation matrix
+        t (3,): Translation vector
+    """
+    try:
+        # EPnP requires at least 4 points
+        if len(object_points) < 4:
+            return False, None, None
+
+        # Ensure correct data types
+        object_points = object_points.astype(np.float64)
+        image_points = image_points.astype(np.float64)
+        camera_matrix = camera_matrix.astype(np.float64)
+
+        # Solve PnP with EPnP algorithm
+        success, rvec, tvec = cv2.solvePnP(
+            object_points,
+            image_points,
+            camera_matrix,
+            None,  # No distortion
+            flags=cv2.SOLVEPNP_EPNP  # Use EPnP algorithm
+        )
+
+        if not success:
+            return False, None, None
+
+        # Convert rotation vector to rotation matrix
+        R, _ = cv2.Rodrigues(rvec)
+        t = tvec.flatten()
+
+        return True, R, t
+
+    except Exception as e:
+        # PnP can fail for degenerate cases
+        return False, None, None
+
 
 def get_keypoints_from_heatmaps(heatmaps):
     """
@@ -43,10 +89,10 @@ def get_keypoints_from_heatmaps(heatmaps):
     B, N, H, W = heatmaps.shape
     heatmaps_flat = heatmaps.view(B, N, -1)
     max_indices = torch.argmax(heatmaps_flat, dim=-1)
-    
+
     y = max_indices // W
     x = max_indices % W
-    
+
     return torch.stack([x, y], dim=-1).float()
 
 
@@ -78,9 +124,16 @@ def soft_argmax_2d(heatmaps, temperature=10.0):
 class UnifiedPoseLoss(nn.Module):
     """
     Multi-task loss for Pose Estimation:
-    1. 2D Heatmap Loss (MSE)
-    2. 3D Keypoint Lifting Loss (SmoothL1)
+    1. 2D Heatmap Loss (configurable: MSE/L1/SmoothL1)
+    2. 3D Keypoint Lifting Loss (configurable: MSE/L1/SmoothL1)
     3. Camera-frame 3D loss (for joint_angle mode with PnP transform)
+    4. Adaptive loss weighting (uncertainty-based)
+    5. PnP failure penalty
+
+    Loss type recommendation:
+    - MSE: Traditional, sensitive to outliers
+    - L1: Robust to outliers, aligns with ADD metric
+    - SmoothL1 (Huber): Best of both - L2 for small errors, L1 for large errors
     """
     def __init__(
         self,
@@ -90,6 +143,9 @@ class UnifiedPoseLoss(nn.Module):
         angle_weight: float = 0.0,  # Joint angle MSE loss weight
         fk_3d_weight: float = 0.0,  # FK 3D keypoint MSE loss weight (robot frame)
         camera_3d_weight: float = 0.0,  # Camera-frame 3D loss weight (with PnP transform)
+        loss_type: str = 'smoothl1',  # Loss function type: 'mse', 'l1', 'smoothl1'
+        use_adaptive_weighting: bool = True,  # Use uncertainty-based adaptive weighting
+        pnp_failure_penalty_weight: float = 0.1,  # PnP failure penalty weight
     ):
         super().__init__()
         self.heatmap_weight = heatmap_weight
@@ -98,8 +154,25 @@ class UnifiedPoseLoss(nn.Module):
         self.angle_weight = angle_weight
         self.fk_3d_weight = fk_3d_weight
         self.camera_3d_weight = camera_3d_weight
+        self.loss_type = loss_type
+        self.use_adaptive_weighting = use_adaptive_weighting
+        self.pnp_failure_penalty_weight = pnp_failure_penalty_weight
 
-        self.heatmap_loss = nn.MSELoss()
+        # Select loss function based on type
+        if loss_type == 'mse':
+            self.loss_fn = nn.MSELoss(reduction='none')
+        elif loss_type == 'l1':
+            self.loss_fn = nn.L1Loss(reduction='none')
+        elif loss_type == 'smoothl1':
+            self.loss_fn = nn.SmoothL1Loss(reduction='none', beta=1.0)
+        else:
+            raise ValueError(f"Unknown loss type: {loss_type}")
+
+        # Adaptive loss weighting parameters (learnable uncertainty)
+        if use_adaptive_weighting:
+            self.log_sigma_heatmap = nn.Parameter(torch.zeros(1))
+            self.log_sigma_3d = nn.Parameter(torch.zeros(1))
+
         self.eps = 1e-6  # Numerical stability
 
     def forward(self, pred_dict, gt_dict):
@@ -121,43 +194,58 @@ class UnifiedPoseLoss(nn.Module):
         # 1. 2D Heatmap Loss (2D 위치 정밀도) - with masking
         if valid_mask is not None:
             mask_expanded = valid_mask.unsqueeze(-1).unsqueeze(-1).float()  # (B, MAX_JOINTS, 1, 1)
-            heatmap_diff = (pred_dict['heatmaps_2d'] - gt_dict['heatmaps_2d']) ** 2
+            heatmap_diff = self.loss_fn(pred_dict['heatmaps_2d'], gt_dict['heatmaps_2d'])
             heatmap_diff_masked = heatmap_diff * mask_expanded
             loss_heatmap = heatmap_diff_masked.sum() / (mask_expanded.sum() + self.eps)
         else:
-            loss_heatmap = self.heatmap_loss(pred_dict['heatmaps_2d'], gt_dict['heatmaps_2d'])
+            heatmap_diff = self.loss_fn(pred_dict['heatmaps_2d'], gt_dict['heatmaps_2d'])
+            loss_heatmap = heatmap_diff.mean()
 
-        # 2. 3D Keypoint Loss (MSE) - with masking
+        # 2. 3D Keypoint Loss - with masking
         kp3d_pred = pred_dict['keypoints_3d']
         kp3d_gt = gt_dict['keypoints_3d']
 
         if valid_mask is not None:
             mask_expanded = valid_mask.unsqueeze(-1).float()  # (B, MAX_JOINTS, 1)
-            kp3d_diff = (kp3d_pred - kp3d_gt) ** 2  # (B, MAX_JOINTS, 3)
+            kp3d_diff = self.loss_fn(kp3d_pred, kp3d_gt)  # (B, MAX_JOINTS, 3)
             kp3d_diff_masked = kp3d_diff * mask_expanded
             loss_kp3d = kp3d_diff_masked.sum() / (mask_expanded.sum() + self.eps)
         else:
-            loss_kp3d = torch.nn.functional.mse_loss(
-                kp3d_pred, kp3d_gt, reduction='mean'
+            kp3d_diff = self.loss_fn(kp3d_pred, kp3d_gt)
+            loss_kp3d = kp3d_diff.mean()
+
+        # Total Loss with Adaptive Weighting or Fixed Weights
+        if self.use_adaptive_weighting:
+            # Uncertainty-based weighting: loss / (2 * exp(log_sigma)) + log_sigma
+            # This automatically balances losses based on learned task uncertainty
+            total_loss = (
+                loss_heatmap / (2 * torch.exp(self.log_sigma_heatmap)) + self.log_sigma_heatmap +
+                loss_kp3d / (2 * torch.exp(self.log_sigma_3d)) + self.log_sigma_3d
             )
-
-        # Total Loss (Weighted Sum)
-        total_loss = (
-            self.heatmap_weight * loss_heatmap +
-            self.kp3d_weight * loss_kp3d
-        )
-
-        loss_dict = {
-            'total': total_loss.item(),
-            'heatmap': loss_heatmap.item(),
-            'kp3d': loss_kp3d.item(),
-        }
+            loss_dict = {
+                'total': total_loss.item(),
+                'heatmap': loss_heatmap.item(),
+                'kp3d': loss_kp3d.item(),
+                'sigma_hm': torch.exp(self.log_sigma_heatmap).item(),
+                'sigma_3d': torch.exp(self.log_sigma_3d).item(),
+            }
+        else:
+            # Fixed weighting
+            total_loss = (
+                self.heatmap_weight * loss_heatmap +
+                self.kp3d_weight * loss_kp3d
+            )
+            loss_dict = {
+                'total': total_loss.item(),
+                'heatmap': loss_heatmap.item(),
+                'kp3d': loss_kp3d.item(),
+            }
 
         # Joint angle loss (joint_angle mode only)
         if self.angle_weight > 0 and 'joint_angles' in pred_dict and 'angles' in gt_dict:
             pred_angles = pred_dict['joint_angles']  # (B, 7)
             gt_angles = gt_dict['angles']  # (B, 7)
-            loss_angle = torch.nn.functional.mse_loss(pred_angles, gt_angles)
+            loss_angle = self.loss_fn(pred_angles, gt_angles).mean()
             total_loss = total_loss + self.angle_weight * loss_angle
             loss_dict['angle'] = loss_angle.item()
 
@@ -166,7 +254,7 @@ class UnifiedPoseLoss(nn.Module):
             pred_kp_robot = pred_dict['keypoints_3d_robot']  # (B, 7, 3) already FK'd
             gt_angles = gt_dict['angles']  # (B, 7)
             gt_kp_robot = panda_forward_kinematics(gt_angles)  # (B, 7, 3)
-            loss_fk_3d = torch.nn.functional.mse_loss(pred_kp_robot, gt_kp_robot)
+            loss_fk_3d = self.loss_fn(pred_kp_robot, gt_kp_robot).mean()
             total_loss = total_loss + self.fk_3d_weight * loss_fk_3d
             loss_dict['fk_3d'] = loss_fk_3d.item()
 
@@ -196,6 +284,8 @@ class UnifiedPoseLoss(nn.Module):
                     # Transform robot-frame to camera-frame using GT-based PnP (for stability)
                     B = pred_kp_robot.shape[0]
                     pred_kp_camera_list = []
+                    gt_kp_camera_list = []
+                    valid_indices = []  # Track successful PnP samples
 
                     for b in range(B):
                         # Use GT robot-frame (from FK) for PnP to get stable transform
@@ -209,42 +299,62 @@ class UnifiedPoseLoss(nn.Module):
                         gt_kp_2d_np = gt_kp_2d_b.detach().cpu().numpy()
                         camera_K_np = camera_K_b.detach().cpu().numpy()
 
-                        # Solve PnP to get robot-to-camera transform
-                        pnp_retval, translation, quaternion = dream.geometric_vision.solve_pnp(
+                        # Solve PnP using EPnP algorithm to get robot-to-camera transform
+                        success, R, t = solve_pnp_epnp(
                             gt_kp_robot_np, gt_kp_2d_np, camera_K_np
                         )
 
-                        if pnp_retval:
-                            # Convert quaternion to rotation matrix
-                            R = Rotation.from_quat(quaternion).as_matrix()  # (3, 3)
+                        if success:
+                            # Convert to tensors
                             R_tensor = torch.from_numpy(R).float().to(pred_kp_robot.device)
-                            t_tensor = torch.from_numpy(translation).float().to(pred_kp_robot.device)
+                            t_tensor = torch.from_numpy(t).float().to(pred_kp_robot.device)
 
                             # Transform predicted robot-frame to camera-frame
                             pred_kp_robot_b = pred_kp_robot[b]  # (7, 3)
                             pred_kp_camera_b = (R_tensor @ pred_kp_robot_b.T).T + t_tensor  # (7, 3)
+
                             pred_kp_camera_list.append(pred_kp_camera_b)
-                        else:
-                            # PnP failed, skip this sample
-                            pred_kp_camera_list.append(pred_kp_robot[b])  # Use robot frame as fallback
+                            gt_kp_camera_list.append(gt_kp_camera[b])
+                            valid_indices.append(b)
+                        # else: Skip failed PnP samples entirely (don't add to loss)
 
+                    # Compute loss only for successful PnP samples
                     if len(pred_kp_camera_list) > 0:
-                        pred_kp_camera = torch.stack(pred_kp_camera_list, dim=0)  # (B, 7, 3)
+                        pred_kp_camera = torch.stack(pred_kp_camera_list, dim=0)  # (N_valid, 7, 3)
+                        gt_kp_camera_valid = torch.stack(gt_kp_camera_list, dim=0)  # (N_valid, 7, 3)
 
-                        # Compute loss in camera frame
+                        # Apply valid_mask if available (only for valid PnP samples)
                         if valid_mask is not None:
-                            mask_expanded = valid_mask.unsqueeze(-1).float()  # (B, 7, 1)
-                            camera_3d_diff = (pred_kp_camera - gt_kp_camera) ** 2
+                            valid_mask_subset = valid_mask[valid_indices]  # (N_valid, 7)
+                            mask_expanded = valid_mask_subset.unsqueeze(-1).float()  # (N_valid, 7, 1)
+                            camera_3d_diff = self.loss_fn(pred_kp_camera, gt_kp_camera_valid)
                             camera_3d_diff_masked = camera_3d_diff * mask_expanded
                             loss_camera_3d = camera_3d_diff_masked.sum() / (mask_expanded.sum() + self.eps)
                         else:
-                            loss_camera_3d = torch.nn.functional.mse_loss(pred_kp_camera, gt_kp_camera)
+                            loss_camera_3d = self.loss_fn(pred_kp_camera, gt_kp_camera_valid).mean()
 
                         total_loss = total_loss + self.camera_3d_weight * loss_camera_3d
                         loss_dict['camera_3d'] = loss_camera_3d.item()
+
+                        # Track PnP success rate and add failure penalty
+                        pnp_success_rate = len(valid_indices) / B
+                        loss_dict['pnp_success_rate'] = pnp_success_rate
+
+                        # Add penalty if PnP success rate is low (< 90%)
+                        if pnp_success_rate < 0.9:
+                            pnp_penalty = (1 - pnp_success_rate) * self.pnp_failure_penalty_weight
+                            total_loss = total_loss + pnp_penalty
+                            loss_dict['pnp_penalty'] = pnp_penalty
+                    else:
+                        # All PnP failed - high penalty
+                        loss_dict['pnp_success_rate'] = 0.0
+                        pnp_penalty = self.pnp_failure_penalty_weight
+                        total_loss = total_loss + pnp_penalty
+                        loss_dict['pnp_penalty'] = pnp_penalty
+
                 except Exception as e:
                     # PnP can fail, gracefully skip camera-frame loss
-                    print(f"Warning: Camera-frame 3D loss failed: {e}")
+                    # print(f"Warning: Camera-frame 3D loss failed: {e}")
                     pass
 
         # Update total in loss_dict
@@ -998,16 +1108,23 @@ def main(args):
             num_workers=args.num_workers,
             image_size=(args.image_size, args.image_size),
             heatmap_size=(args.heatmap_size, args.heatmap_size),
-            worker_init_fn=worker_init_fn
+            val_split=args.val_split,
+            # worker_init_fn=worker_init_fn,
+            multi_robot=args.multi_robot,
+            robot_types=args.robot_types,
+            fda_real_dir=args.fda_real_dir,
+            fda_beta=args.fda_beta,
+            fda_prob=args.fda_prob
         )
     else:
-        # Split single dataset
-        dataset = PoseEstimationDataset(
+        # Create separate train and val datasets with different augmentation settings
+        # This is more robust than modifying augment flag after random_split
+        base_dataset = PoseEstimationDataset(
             data_dir=args.data_dir,
             keypoint_names=keypoint_names,
             image_size=(args.image_size, args.image_size),
             heatmap_size=(args.heatmap_size, args.heatmap_size),
-            augment=True,
+            augment=False,  # Temporarily disable to get indices
             multi_robot=args.multi_robot,
             robot_types=args.robot_types,
             fda_real_dir=args.fda_real_dir,
@@ -1015,16 +1132,43 @@ def main(args):
             fda_prob=args.fda_prob
         )
 
-        # Split into train/val with reproducible split
-        train_size = int(args.train_split * len(dataset))
-        val_size = len(dataset) - train_size
-
-        # Use generator for reproducible split
+        # Split indices with reproducible split
+        train_size = int(args.train_split * len(base_dataset))
+        val_size = len(base_dataset) - train_size
         generator = torch.Generator().manual_seed(args.seed if args.seed is not None else 42)
-        train_dataset, val_dataset = random_split(dataset, [train_size, val_size], generator=generator)
+        train_indices, val_indices = random_split(
+            range(len(base_dataset)), [train_size, val_size], generator=generator
+        )
 
-        # Disable augmentation for validation
-        val_dataset.dataset.augment = False
+        # Create train dataset with augmentation
+        train_dataset_full = PoseEstimationDataset(
+            data_dir=args.data_dir,
+            keypoint_names=keypoint_names,
+            image_size=(args.image_size, args.image_size),
+            heatmap_size=(args.heatmap_size, args.heatmap_size),
+            augment=False,  # Disable augmentation for training
+            multi_robot=args.multi_robot,
+            robot_types=args.robot_types,
+            fda_real_dir=args.fda_real_dir,
+            fda_beta=args.fda_beta,
+            fda_prob=args.fda_prob
+        )
+        train_dataset = torch.utils.data.Subset(train_dataset_full, train_indices.indices)
+
+        # Create val dataset without augmentation
+        val_dataset_full = PoseEstimationDataset(
+            data_dir=args.data_dir,
+            keypoint_names=keypoint_names,
+            image_size=(args.image_size, args.image_size),
+            heatmap_size=(args.heatmap_size, args.heatmap_size),
+            augment=False,  # Disable augmentation for validation
+            multi_robot=args.multi_robot,
+            robot_types=args.robot_types,
+            fda_real_dir=None,  # No FDA for validation
+            fda_beta=args.fda_beta,
+            fda_prob=0.0  # No FDA for validation
+        )
+        val_dataset = torch.utils.data.Subset(val_dataset_full, val_indices.indices)
 
         # Create samplers for distributed training
         if is_distributed:
@@ -1050,8 +1194,8 @@ def main(args):
             shuffle=(train_sampler is None),
             sampler=train_sampler,
             num_workers=args.num_workers,
-            pin_memory=True,
-            worker_init_fn=worker_init_fn
+            pin_memory=True
+            # worker_init_fn=worker_init_fn
         )
 
         val_loader = DataLoader(
@@ -1060,8 +1204,8 @@ def main(args):
             shuffle=False,
             sampler=val_sampler,
             num_workers=args.num_workers,
-            pin_memory=True,
-            worker_init_fn=worker_init_fn
+            pin_memory=True
+            # worker_init_fn=worker_init_fn
         )
 
     if is_main_process:
@@ -1155,7 +1299,8 @@ def main(args):
         angle_weight=angle_w,
         fk_3d_weight=fk_3d_w,
         camera_3d_weight=camera_3d_w,  # Camera-frame 3D loss (PnP-based transform)
-    )
+        loss_type=args.loss_type,  # Loss function type: 'mse', 'l1', 'smoothl1'
+    ).to(device)
 
     # Optimizer
     if args.optimizer == 'adam':
@@ -1180,8 +1325,11 @@ def main(args):
     else:
         raise ValueError(f"Unknown optimizer: {args.optimizer}")
 
-    # Learning rate scheduler
+    # Learning rate scheduler with warmup (skip warmup if resuming)
     scheduler = None
+    warmup_epochs = 5  # Number of warmup epochs
+    use_warmup = args.scheduler == 'cosine' and not args.resume  # Only warmup for cosine and new training
+
     if args.scheduler == 'step':
         scheduler = optim.lr_scheduler.StepLR(
             optimizer,
@@ -1189,13 +1337,35 @@ def main(args):
             gamma=args.lr_gamma
         )
     elif args.scheduler == 'cosine':
-        scheduler = optim.lr_scheduler.CosineAnnealingLR(
-            optimizer,
-            T_max=args.epochs,
-            eta_min=args.min_lr  # Minimum learning rate
-        )
-        if is_main_process:
-            print(f"Using CosineAnnealingLR: initial_lr={args.learning_rate}, min_lr={args.min_lr}, T_max={args.epochs}")
+        if use_warmup:
+            # Warmup + Cosine schedule (only for new training, not resume)
+            from torch.optim.lr_scheduler import SequentialLR, LinearLR
+            warmup_scheduler = LinearLR(
+                optimizer,
+                start_factor=0.1,
+                total_iters=warmup_epochs
+            )
+            cosine_scheduler = optim.lr_scheduler.CosineAnnealingLR(
+                optimizer,
+                T_max=args.epochs - warmup_epochs,
+                eta_min=args.min_lr
+            )
+            scheduler = SequentialLR(
+                optimizer,
+                schedulers=[warmup_scheduler, cosine_scheduler],
+                milestones=[warmup_epochs]
+            )
+            if is_main_process:
+                print(f"Using Warmup({warmup_epochs}ep) + CosineAnnealingLR: initial_lr={args.learning_rate}, min_lr={args.min_lr}, T_max={args.epochs}")
+        else:
+            # Just cosine (for resume)
+            scheduler = optim.lr_scheduler.CosineAnnealingLR(
+                optimizer,
+                T_max=args.epochs,
+                eta_min=args.min_lr
+            )
+            if is_main_process:
+                print(f"Using CosineAnnealingLR: initial_lr={args.learning_rate}, min_lr={args.min_lr}, T_max={args.epochs}")
     elif args.scheduler == 'plateau':
         scheduler = optim.lr_scheduler.ReduceLROnPlateau(
             optimizer,
@@ -1264,6 +1434,8 @@ if __name__ == '__main__':
                         help='Path to validation data directory (optional)')
     parser.add_argument('--train-split', type=float, default=0.9,
                         help='Train/val split ratio if val-dir not provided (DREAM uses 0.8, we use 0.9)')
+    parser.add_argument('--val-split', type=float, default=1.0,
+                        help='Fraction of validation data to use (default=1.0 for all data)')
     parser.add_argument('--multi-robot', action='store_true',
                         help='Load data from multiple robot subdirectories for unified model')
     parser.add_argument('--robot-types', type=str, nargs='+', default=None,
@@ -1323,6 +1495,9 @@ if __name__ == '__main__':
                         help='Minimum learning rate for CosineAnnealingLR scheduler')
 
     # Loss weights
+    parser.add_argument('--loss-type', type=str, default='smoothl1',
+                        choices=['mse', 'l1', 'smoothl1'],
+                        help='Loss function type (smoothl1 recommended for ADD AUC)')
     parser.add_argument('--heatmap-weight', type=float, default=1.0,
                         help='Weight for heatmap loss')
     parser.add_argument('--kp3d-weight', type=float, default=10.0,

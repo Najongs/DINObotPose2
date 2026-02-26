@@ -20,6 +20,7 @@ from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 from PIL import Image
 import torchvision.transforms as transforms
+import cv2
 
 # Import DREAM utilities
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../DREAM')))
@@ -139,7 +140,7 @@ def get_keypoints_from_heatmaps(heatmaps: torch.Tensor) -> np.ndarray:
 
 def transform_robot_to_camera(robot_kpts, pred_2d, camera_K):
     """
-    Transform robot frame keypoints to camera frame using PnP.
+    Transform robot frame keypoints to camera frame using EPnP.
 
     Args:
         robot_kpts: (N, 3) keypoints in robot frame
@@ -149,22 +150,39 @@ def transform_robot_to_camera(robot_kpts, pred_2d, camera_K):
     Returns:
         camera_kpts: (N, 3) keypoints in camera frame (or None if PnP fails)
     """
-    # Solve PnP to get robot-to-camera transform
-    pnp_retval, translation, quaternion = dream.geometric_vision.solve_pnp(
-        robot_kpts, pred_2d, camera_K
-    )
+    try:
+        # EPnP requires at least 4 points
+        if len(robot_kpts) < 4:
+            return None
 
-    if not pnp_retval:
+        # Ensure correct data types
+        robot_kpts = robot_kpts.astype(np.float64)
+        pred_2d = pred_2d.astype(np.float64)
+        camera_K = camera_K.astype(np.float64)
+
+        # Solve PnP with EPnP algorithm
+        success, rvec, tvec = cv2.solvePnP(
+            robot_kpts,
+            pred_2d,
+            camera_K,
+            None,  # No distortion
+            flags=cv2.SOLVEPNP_EPNP  # Use EPnP algorithm
+        )
+
+        if not success:
+            return None
+
+        # Convert rotation vector to rotation matrix
+        R, _ = cv2.Rodrigues(rvec)
+        t = tvec.flatten()
+
+        # Transform: camera_frame = R @ robot_frame + t
+        camera_kpts = (R @ robot_kpts.T).T + t.reshape(1, 3)
+
+        return camera_kpts
+
+    except Exception as e:
         return None
-
-    # Convert quaternion to rotation matrix
-    from scipy.spatial.transform import Rotation
-    R = Rotation.from_quat(quaternion).as_matrix()  # (3, 3)
-
-    # Transform: camera_frame = R @ robot_frame + t
-    camera_kpts = (R @ robot_kpts.T).T + translation.reshape(1, 3)
-
-    return camera_kpts
 
 
 def compute_keypoint_metrics(
@@ -626,18 +644,33 @@ def run_inference(args):
             kp_det_pnp = kp_det[idx_good]
             kp_3d_pnp = kp_3d[idx_good]
 
-            # Solve PnP
-            pnp_retval, translation, quaternion = dream.geometric_vision.solve_pnp(
-                kp_3d_pnp, kp_det_pnp, camera_K
-            )
-
-            if pnp_retval:
-                # Compute ADD
-                add = dream.geometric_vision.add_from_pose(
-                    translation, quaternion, kp_3d_pnp, camera_K
+            # Solve PnP using EPnP
+            try:
+                success, rvec, tvec = cv2.solvePnP(
+                    kp_3d_pnp.astype(np.float64),
+                    kp_det_pnp.astype(np.float64),
+                    camera_K.astype(np.float64),
+                    None,  # No distortion
+                    flags=cv2.SOLVEPNP_EPNP
                 )
-                pnp_adds.append(add)
-            else:
+
+                if success:
+                    # Convert to rotation matrix and quaternion for DREAM compatibility
+                    R, _ = cv2.Rodrigues(rvec)
+                    t = tvec.flatten()
+
+                    # Convert R to quaternion (xyzw format for scipy)
+                    from scipy.spatial.transform import Rotation
+                    quaternion = Rotation.from_matrix(R).as_quat()  # [x, y, z, w]
+
+                    # Use DREAM's ADD computation
+                    add = dream.geometric_vision.add_from_pose(
+                        t, quaternion, kp_3d_pnp, camera_K
+                    )
+                    pnp_adds.append(add)
+                else:
+                    pnp_adds.append(-999.0)
+            except Exception:
                 pnp_adds.append(-999.0)
         else:
             pnp_adds.append(-999.0)

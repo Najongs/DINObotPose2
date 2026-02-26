@@ -23,7 +23,7 @@ import dream
 
 # Import model from Train directory
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../Train')))
-from model import DINOv3PoseEstimator
+from model import DINOv3PoseEstimator, MODE_DIRECT, MODE_DEPTH_ONLY
 
 
 def get_keypoints_from_heatmaps(heatmaps_tensor):
@@ -145,6 +145,7 @@ def network_inference(args):
     config_path = checkpoint_dir / 'config.yaml'
 
     use_joint_embedding = False
+    depth_only_3d = False
     model_name = args.model_name
     image_size = 512
     heatmap_size = 512
@@ -153,12 +154,13 @@ def network_inference(args):
         with open(config_path, 'r') as f:
             train_config = yaml.safe_load(f)
         use_joint_embedding = train_config.get('use_joint_embedding', False)
+        depth_only_3d = train_config.get('depth_only_3d', False)
         model_name = train_config.get('model_name', model_name)
         image_size = int(train_config.get('image_size', image_size))
         heatmap_size = int(train_config.get('heatmap_size', heatmap_size))
         if 'keypoint_names' in train_config:
             keypoint_names = train_config['keypoint_names']
-        print(f"# Config: use_joint_embedding={use_joint_embedding}")
+        print(f"# Config: use_joint_embedding={use_joint_embedding}, depth_only_3d={depth_only_3d}")
 
     # Load annotation JSON
     print(f"\n# Loading annotation: {args.json_path}")
@@ -175,11 +177,13 @@ def network_inference(args):
         print(f"# Camera K:\n{camera_K}")
 
     # Create model
+    mode_3d = MODE_DEPTH_ONLY if depth_only_3d else MODE_DIRECT
     model = DINOv3PoseEstimator(
         dino_model_name=model_name,
         heatmap_size=(heatmap_size, heatmap_size),
         unfreeze_blocks=0,
-        use_joint_embedding=use_joint_embedding
+        use_joint_embedding=use_joint_embedding,
+        mode_3d=mode_3d
     ).to(device)
 
     # Load checkpoint
@@ -213,8 +217,13 @@ def network_inference(args):
     print("\n# Running inference...")
     image_tensor = transform(image_pil).unsqueeze(0).to(device)
 
+    # Prepare camera_K tensor for depth_only mode
+    camera_K_tensor = None
+    if camera_K is not None:
+        camera_K_tensor = torch.tensor(camera_K, dtype=torch.float32).unsqueeze(0).to(device)
+
     with torch.no_grad():
-        outputs = model(image_tensor)
+        outputs = model(image_tensor, camera_K=camera_K_tensor, original_size=orig_dim)
         pred_heatmaps = outputs["heatmaps_2d"]
         pred_kpts_3d = outputs["keypoints_3d"]
 

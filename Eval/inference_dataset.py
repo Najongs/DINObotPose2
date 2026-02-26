@@ -1,8 +1,9 @@
 """
 Dataset Inference Script for DINOv3 Pose Estimation
-Evaluates a trained model on a dataset with DREAM-style metrics:
+Evaluates a trained model on a dataset with metrics:
 - L2 error (px) for in-frame keypoints with AUC
-- ADD (m) for frames where PnP was successful with AUC
+- ADD (m) from model's 3D head: pred_3d vs GT_3d direct comparison
+- ADD (m) from PnP baseline (DREAM-style): 2D pred + GT_3d + K -> PnP -> ADD
 """
 
 import argparse
@@ -27,7 +28,7 @@ from dream import analysis as dream_analysis
 
 # Import model from TRAIN directory
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../Train')))
-from model import DINOv3PoseEstimator
+from model import DINOv3PoseEstimator, MODE_DIRECT, MODE_DEPTH_ONLY
 
 
 class InferenceDataset(Dataset):
@@ -267,6 +268,82 @@ def compute_pnp_metrics(
         'add_auc_thresh': add_auc_threshold,
     }
 
+def compute_direct_add_metrics(
+    pred_3d_all: np.ndarray,
+    gt_3d_all: np.ndarray,
+    add_auc_threshold: float = 0.1,
+) -> Dict:
+    """
+    Compute ADD metrics by directly comparing model's predicted 3D keypoints
+    with GT 3D keypoints (like HoRoPose / RoboPEPP evaluation).
+
+    Args:
+        pred_3d_all: (N_frames, N_kp, 3) predicted 3D keypoints from model
+        gt_3d_all: (N_frames, N_kp, 3) ground truth 3D keypoints
+        add_auc_threshold: AUC threshold in meters
+
+    Returns:
+        metrics dictionary
+    """
+    # Per-frame mean 3D distance (ADD = average of per-keypoint L2 distances)
+    # Only use valid GT keypoints (not all-zero)
+    frame_adds = []
+    per_kp_errors = []
+
+    for pred_3d, gt_3d in zip(pred_3d_all, gt_3d_all):
+        # Valid mask: GT keypoints that are not zero
+        valid = np.any(gt_3d != 0, axis=-1)  # (N_kp,)
+        if valid.sum() == 0:
+            continue
+
+        pred_valid = pred_3d[valid]
+        gt_valid = gt_3d[valid]
+
+        # Per-keypoint L2 distance
+        kp_dists = np.linalg.norm(pred_valid - gt_valid, axis=-1)  # (N_valid,)
+        per_kp_errors.extend(kp_dists.tolist())
+
+        # ADD = mean per-keypoint distance for this frame
+        frame_add = np.mean(kp_dists)
+        frame_adds.append(frame_add)
+
+    frame_adds = np.array(frame_adds)
+    per_kp_errors = np.array(per_kp_errors)
+    n_frames = len(frame_adds)
+
+    if n_frames == 0:
+        return {
+            'num_frames': 0,
+            'add_mean': None,
+            'add_median': None,
+            'add_std': None,
+            'add_auc': None,
+            'add_auc_thresh': add_auc_threshold,
+            'per_kp_mean': None,
+            'per_kp_median': None,
+        }
+
+    # AUC computation (same method as RoboPEPP)
+    delta_threshold = 0.00001
+    add_threshold_values = np.arange(0.0, add_auc_threshold, delta_threshold)
+    counts = []
+    for value in add_threshold_values:
+        under_threshold = np.mean(frame_adds <= value)
+        counts.append(under_threshold)
+    auc = np.trapz(counts, dx=delta_threshold) / float(add_auc_threshold)
+
+    return {
+        'num_frames': n_frames,
+        'add_mean': float(np.mean(frame_adds)),
+        'add_median': float(np.median(frame_adds)),
+        'add_std': float(np.std(frame_adds)),
+        'add_auc': float(auc),
+        'add_auc_thresh': float(add_auc_threshold),
+        'per_kp_mean': float(np.mean(per_kp_errors)),
+        'per_kp_median': float(np.median(per_kp_errors)),
+    }
+
+
 def load_camera_from_first_frame(dataset_dir: Path) -> Tuple[np.ndarray, Tuple[int, int]]:
     """
     Load camera intrinsics K and raw image resolution (W,H) from the first frame json.
@@ -348,14 +425,17 @@ def run_inference(args):
         print(f"Warning: Config not found at {config_path}, using defaults")
 
     # Resolve config values (CLI args override config.yaml)
-    model_name = args.model_name or train_config.get('model_name', 'facebook/dinov2-base')
+    model_name = args.model_name or train_config.get('model_name', 'facebook/dinov3-vitb16-pretrain-lvd1689m')
     image_size = args.image_size or int(train_config.get('image_size', 512))
     heatmap_size = args.heatmap_size or int(train_config.get('heatmap_size', 512))
     use_joint_embedding = train_config.get('use_joint_embedding', False)
+    depth_only_3d = train_config.get('depth_only_3d', False)
+    mode_3d = MODE_DEPTH_ONLY if depth_only_3d else MODE_DIRECT
 
     print(f"  model_name: {model_name}")
     print(f"  image_size: {image_size}, heatmap_size: {heatmap_size}")
     print(f"  use_joint_embedding: {use_joint_embedding}")
+    print(f"  depth_only_3d: {depth_only_3d} (mode: {mode_3d})")
 
     # Create dataset
     dataset = InferenceDataset(
@@ -380,7 +460,8 @@ def run_inference(args):
         dino_model_name=model_name,
         heatmap_size=(heatmap_size, heatmap_size),
         unfreeze_blocks=0,  # Not needed for inference
-        use_joint_embedding=use_joint_embedding
+        use_joint_embedding=use_joint_embedding,
+        mode_3d=mode_3d
     ).to(device)
 
     # Load checkpoint
@@ -413,6 +494,10 @@ def run_inference(args):
     all_kp_projs_gt = []
     all_kp_pos_gt = []
     all_n_inframe_projs_gt = []
+    all_pred_3d = []  # Model's direct 3D predictions
+
+    # Prepare camera_K tensor for depth_only mode
+    camera_K_tensor = torch.tensor(camera_K, dtype=torch.float32).to(device) if camera_K is not None else None
 
     print(f"\nRunning inference on {len(dataset)} images...")
 
@@ -421,9 +506,15 @@ def run_inference(args):
         gt_keypoints = batch['keypoints'].numpy()
         gt_keypoints_3d = batch['keypoints_3d'].numpy()
 
+        # Prepare batched camera_K for depth_only mode
+        batch_camera_K = None
+        if camera_K_tensor is not None:
+            batch_camera_K = camera_K_tensor.unsqueeze(0).expand(images.shape[0], -1, -1)
+
         # Forward pass
-        outputs = model(images)
+        outputs = model(images, camera_K=batch_camera_K, original_size=raw_resolution)
         pred_heatmaps = outputs["heatmaps_2d"]
+        pred_kpts_3d = outputs["keypoints_3d"].cpu().numpy()  # (B, N_kp, 3)
 
         # Extract keypoints from heatmaps
         pred_keypoints = get_keypoints_from_heatmaps(pred_heatmaps)
@@ -441,6 +532,7 @@ def run_inference(args):
             all_kp_projs_detected.append(pred_kp_scaled)
             all_kp_projs_gt.append(gt_keypoints[i])
             all_kp_pos_gt.append(gt_keypoints_3d[i])
+            all_pred_3d.append(pred_kpts_3d[i])
 
             # Count in-frame GT keypoints
             n_inframe = 0
@@ -452,8 +544,9 @@ def run_inference(args):
     all_kp_projs_detected = np.array(all_kp_projs_detected)
     all_kp_projs_gt = np.array(all_kp_projs_gt)
     all_kp_pos_gt = np.array(all_kp_pos_gt)
+    all_pred_3d = np.array(all_pred_3d)
 
-    # Compute keypoint metrics
+    # Compute keypoint metrics (2D)
     print("\nComputing keypoint metrics...")
     n_samples = len(all_kp_projs_detected)
     kp_metrics = compute_keypoint_metrics(
@@ -463,8 +556,16 @@ def run_inference(args):
         auc_threshold=args.kp_auc_threshold
     )
 
-    # Compute PnP and ADD metrics
-    print("Computing PnP and ADD metrics...")
+    # ===== Direct ADD: model's 3D head output vs GT 3D =====
+    print("Computing Direct ADD metrics (model 3D head vs GT 3D)...")
+    direct_add_metrics = compute_direct_add_metrics(
+        all_pred_3d,
+        all_kp_pos_gt,
+        add_auc_threshold=args.add_auc_threshold
+    )
+
+    # ===== PnP ADD (DREAM baseline): 2D pred + GT 3D + K -> PnP =====
+    print("Computing PnP ADD metrics (DREAM baseline)...")
     pnp_adds = []
 
     for kp_det, kp_gt, kp_3d, n_inframe in tqdm(
@@ -510,6 +611,7 @@ def run_inference(args):
     print(f"Model: {args.model_path}")
     print(f"Number of frames: {n_samples}")
 
+    # 2D Keypoint metrics
     print(f"\n# L2 error (px) for in-frame keypoints (n = {kp_metrics['num_gt_inframe']}):")
     if kp_metrics['l2_error_auc'] is not None:
         print(f"#    AUC: {kp_metrics['l2_error_auc']:.5f}")
@@ -520,7 +622,21 @@ def run_inference(args):
     else:
         print("#    No valid keypoints found")
 
-    print(f"\n# ADD (m) for frames where PNP was successful when viable (n = {pnp_metrics['num_pnp_found']}):")
+    # Direct ADD (model's 3D head)
+    print(f"\n# Direct ADD (m) - Model 3D head vs GT 3D (n = {direct_add_metrics['num_frames']}):")
+    if direct_add_metrics['add_auc'] is not None:
+        print(f"#    AUC: {direct_add_metrics['add_auc']:.5f}")
+        print(f"#       AUC threshold: {direct_add_metrics['add_auc_thresh']:.5f}")
+        print(f"#    Mean: {direct_add_metrics['add_mean']:.5f}")
+        print(f"#    Median: {direct_add_metrics['add_median']:.5f}")
+        print(f"#    Std Dev: {direct_add_metrics['add_std']:.5f}")
+        print(f"#    Per-keypoint Mean: {direct_add_metrics['per_kp_mean']:.5f}")
+        print(f"#    Per-keypoint Median: {direct_add_metrics['per_kp_median']:.5f}")
+    else:
+        print("#    No valid frames for direct ADD")
+
+    # PnP ADD (DREAM baseline)
+    print(f"\n# PnP ADD (m) - DREAM baseline: 2D pred + GT_3D + K (n = {pnp_metrics['num_pnp_found']}):")
     if pnp_metrics['num_pnp_found'] > 0:
         print(f"#    AUC: {pnp_metrics['add_auc']:.5f}")
         print(f"#       AUC threshold: {pnp_metrics['add_auc_thresh']:.5f}")
@@ -543,6 +659,7 @@ def run_inference(args):
             'model': str(args.model_path),
             'num_frames': n_samples,
             'keypoint_metrics': {k: float(v) if v is not None else None for k, v in kp_metrics.items()},
+            'direct_add_metrics': {k: float(v) if isinstance(v, (int, float, np.number)) else v for k, v in direct_add_metrics.items()},
             'pnp_metrics': {k: float(v) if isinstance(v, (int, float, np.number)) else v for k, v in pnp_metrics.items()}
         }
 

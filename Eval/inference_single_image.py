@@ -241,7 +241,7 @@ def inference_single_image(args):
         print(f"Warning: Config not found at {config_path}, using defaults")
 
     # Use config values, with CLI args as overrides
-    model_name = args.model_name or train_config.get('model_name', 'facebook/dinov2-base')
+    model_name = args.model_name or train_config.get('model_name', 'facebook/dinov3-vitb16-pretrain-lvd1689m')
     image_size = args.image_size or int(train_config.get('image_size', 512))
     heatmap_size = args.heatmap_size or int(train_config.get('heatmap_size', 512))
     use_joint_embedding = train_config.get('use_joint_embedding', False)

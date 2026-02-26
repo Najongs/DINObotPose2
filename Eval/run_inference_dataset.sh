@@ -4,7 +4,7 @@
 # Evaluates trained model on panda-3cam_azure dataset
 
 # Model configuration
-MODEL_PATH="/data/public/NAS/DINObotPose2/Train/outputs/dinov3_base_20260225_125129/best_model.pth"
+MODEL_PATH="/data/public/NAS/DINObotPose2/Train/outputs/dinov3_base_20260226_112034/best_model.pth"
 
 # Dataset
 DATASET_DIR="/data/public/NAS/DINObotPose2/Dataset/Converted_dataset/DREAM_to_DREAM/panda-3cam_azure"

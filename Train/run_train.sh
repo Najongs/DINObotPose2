@@ -8,7 +8,7 @@
 # =============================================================================
 
 # Data paths (REQUIRED - Update these paths!)
-DATA_DIR="/data/public/NAS/DINObotPose2/Dataset/Converted_dataset/DREAM_to_DREAM_syn"  # Training data directory
+DATA_DIR="/data/public/NAS/DINObotPose2/Dataset/Converted_dataset/DREAM_to_DREAM_syn/panda_synth_train_dr"  # Training data directory
 TRAIN_SPLIT=0.9  # Train/Val split ratio (0.9 = 90% train, 10% val)
 
 # Model configuration
@@ -18,10 +18,11 @@ HEATMAP_SIZE=512
 UNFREEZE_BLOCKS=2  # Number of backbone blocks to unfreeze for fine-tuning
 
 USE_JOINT_EMBEDDING=True  # Enable joint identity embeddings in 3D head
+DEPTH_ONLY_3D=True  # Predict only depth (z), recover x,y from 2D heatmap + camera K
 
 # FDA (Fourier Domain Adaptation) for sim-to-real
 FDA_REAL_DIR="/data/public/NAS/DINObotPose2/Dataset/DREAM_real"  # Real images (no labels needed)
-FDA_BETA=0.01   # Low-freq replacement ratio (0.01=subtle tone shift, 0.05=strong)
+FDA_BETA=0.001   # Low-freq replacement ratio (0.01=subtle tone shift, 0.05=strong)
 FDA_PROB=0.5    # Probability of applying FDA per sample (0.0 to disable)
 
 # Training hyperparameters
@@ -29,14 +30,14 @@ EPOCHS=50
 BATCH_SIZE=16
 NUM_WORKERS=4
 OPTIMIZER="adam"  # Options: adam, adamw, sgd
-LEARNING_RATE=5e-4
+LEARNING_RATE=1e-3
 MIN_LR=1e-8
 WEIGHT_DECAY=1e-5
 SCHEDULER="cosine"  # Options: step, cosine, plateau, none
 
 # Loss weights
 HEATMAP_WEIGHT=1.0
-KP3D_WEIGHT=1.0
+KP3D_WEIGHT=100.0
 
 # Output and logging
 OUTPUT_DIR="./outputs/dinov3_base_$(date +%Y%m%d_%H%M%S)"
@@ -45,7 +46,7 @@ WANDB_RUN_NAME="dinov3_base_$(date +%Y%m%d_%H%M%S)"
 
 # Other settings
 SEED=42
-RESUME=""  # Path to checkpoint for resuming (leave empty for new training)
+RESUME="/data/public/NAS/DINObotPose2/Train/outputs/dinov3_base_20260226_112034/best_model.pth"  # Path to checkpoint for resuming (leave empty for new training)
 
 # =============================================================================
 # Training Modes
@@ -72,6 +73,13 @@ else
     JOINT_EMBEDDING_FLAG=""
 fi
 
+# Build depth-only 3D flag
+if [ "${DEPTH_ONLY_3D}" = "True" ] || [ "${DEPTH_ONLY_3D}" = "true" ]; then
+    DEPTH_ONLY_FLAG="--depth-only-3d"
+else
+    DEPTH_ONLY_FLAG=""
+fi
+
 # Build base command
 BASE_CMD="python train.py \
     --data-dir ${DATA_DIR} \
@@ -81,6 +89,7 @@ BASE_CMD="python train.py \
     --heatmap-size ${HEATMAP_SIZE} \
     --unfreeze-blocks ${UNFREEZE_BLOCKS} \
     ${JOINT_EMBEDDING_FLAG} \
+    ${DEPTH_ONLY_FLAG} \
     --epochs ${EPOCHS} \
     --batch-size ${BATCH_SIZE} \
     --num-workers ${NUM_WORKERS} \
@@ -141,6 +150,7 @@ elif [ "${TRAIN_MODE}" = "multi_gpu" ]; then
         --heatmap-size ${HEATMAP_SIZE} \
         --unfreeze-blocks ${UNFREEZE_BLOCKS} \
         ${JOINT_EMBEDDING_FLAG} \
+        ${DEPTH_ONLY_FLAG} \
         --epochs ${EPOCHS} \
         --batch-size ${BATCH_SIZE} \
         --num-workers ${NUM_WORKERS} \

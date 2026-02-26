@@ -7,6 +7,35 @@ from transformers import AutoModel, SiglipVisionModel
 FEATURE_DIM = 512
 NUM_JOINTS = 7  # DO NOT CHANGE: This value is intentionally set to 7.
 
+# 3D prediction modes
+MODE_DIRECT = 'direct'        # Predict (x, y, z) directly from features
+MODE_DEPTH_ONLY = 'depth_only'  # Predict z only, recover x,y from 2D heatmap + camera K
+
+
+def soft_argmax_2d(heatmaps, temperature=10.0):
+    """
+    Differentiable soft-argmax to extract (u, v) from heatmaps.
+    Args:
+        heatmaps: (B, N, H, W)
+        temperature: scaling factor for softmax sharpness
+    Returns:
+        (B, N, 2) [x, y] coordinates in heatmap pixel space
+    """
+    B, N, H, W = heatmaps.shape
+    device = heatmaps.device
+
+    x_coords = torch.arange(W, device=device, dtype=torch.float32)
+    y_coords = torch.arange(H, device=device, dtype=torch.float32)
+
+    heatmaps_flat = heatmaps.reshape(B, N, -1)
+    weights = F.softmax(heatmaps_flat * temperature, dim=-1)
+    weights = weights.reshape(B, N, H, W)
+
+    x = (weights.sum(dim=2) * x_coords).sum(dim=-1)  # (B, N)
+    y = (weights.sum(dim=3) * y_coords).sum(dim=-1)  # (B, N)
+
+    return torch.stack([x, y], dim=-1)  # (B, N, 2)
+
 class DINOv3Backbone(nn.Module):
     def __init__(self, model_name, unfreeze_blocks=2):
         super().__init__()
@@ -118,19 +147,44 @@ class ViTKeypointHead(nn.Module):
 
 class Keypoint3DHead(nn.Module):
     """
-    Predicts 3D coordinates (x, y, z) for each joint by pooling backbone features
-    at predicted 2D keypoint locations and reasoning about joint relationships.
-    Optionally adds Joint Identity Embeddings to learn kinematic constraints.
+    Predicts 3D coordinates for each joint.
+
+    Supports two modes:
+    - 'direct': Predict (x, y, z) directly from features (original behavior)
+    - 'depth_only': Predict z only, recover x,y from 2D heatmap + camera K
+
+    Improvements over naive regression:
+    - Explicit 2D coordinate injection: soft-argmax (u,v) concatenated to joint features
+    - Mean pose + residual: predicts offset from dataset mean, reducing output range
     """
-    def __init__(self, input_dim=FEATURE_DIM, num_joints=NUM_JOINTS, use_joint_embedding=False):
+    # Mean 3D pose computed from DREAM synthetic training set (meters, camera frame)
+    # Order: link0, link2, link3, link4, link6, link7, hand
+    MEAN_POSE = [
+        [ 0.0008,  0.2679,  1.1670],
+        [ 0.0008,  0.0224,  0.9769],
+        [-0.0070, -0.1568,  0.8290],
+        [-0.0082, -0.1421,  0.8336],
+        [-0.0058, -0.0479,  0.8884],
+        [-0.0059, -0.0340,  0.8937],
+        [-0.0022,  0.0054,  0.9236],
+    ]
+
+    def __init__(self, input_dim=FEATURE_DIM, num_joints=NUM_JOINTS,
+                 use_joint_embedding=False, mode=MODE_DIRECT):
         super().__init__()
         self.num_joints = num_joints
         self.use_joint_embedding = use_joint_embedding
         self.hidden_dim = 256
+        self.mode = mode
+
+        # Register mean pose as buffer (moves to correct device automatically)
+        self.register_buffer('mean_pose',
+                             torch.tensor(self.MEAN_POSE, dtype=torch.float32))  # (NJ, 3)
 
         # 1. Per-joint feature refinement
+        # Input: visual feature (input_dim) + normalized 2D coords (2)
         self.joint_feature_net = nn.Sequential(
-            nn.Linear(input_dim, self.hidden_dim),
+            nn.Linear(input_dim + 2, self.hidden_dim),
             nn.GELU(),
             nn.LayerNorm(self.hidden_dim)
         )
@@ -139,7 +193,7 @@ class Keypoint3DHead(nn.Module):
         if use_joint_embedding:
             self.joint_embedding = nn.Embedding(num_joints, self.hidden_dim)
 
-        # 3. Self-attention for kinematic constraint learning``
+        # 3. Self-attention for kinematic constraint learning
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=self.hidden_dim,
             nhead=8,
@@ -150,21 +204,51 @@ class Keypoint3DHead(nn.Module):
         )
         self.joint_relation_net = nn.TransformerEncoder(encoder_layer, num_layers=4)
 
-        # 4. Predict 3D coordinates (x, y, z)
-        self.coord_predictor = nn.Sequential(
-            nn.Linear(self.hidden_dim, 128),
-            nn.GELU(),
-            nn.LayerNorm(128),
-            nn.Linear(128, 3)
-        )
+        # 4. Output head depends on mode
+        if mode == MODE_DEPTH_ONLY:
+            # Predict only depth residual (Δz) per joint
+            self.depth_predictor = nn.Sequential(
+                nn.Linear(self.hidden_dim, 128),
+                nn.GELU(),
+                nn.LayerNorm(128),
+                nn.Linear(128, 1)
+            )
+        else:
+            # Predict residual (Δx, Δy, Δz) per joint
+            self.coord_predictor = nn.Sequential(
+                nn.Linear(self.hidden_dim, 128),
+                nn.GELU(),
+                nn.LayerNorm(128),
+                nn.Linear(128, 3)
+            )
 
-    def forward(self, dino_features, predicted_heatmaps):
+    def forward(self, dino_features, predicted_heatmaps, camera_K=None,
+                heatmap_size=None, original_size=None):
+        """
+        Args:
+            dino_features: (B, N, D) backbone patch tokens
+            predicted_heatmaps: (B, NUM_JOINTS, H, W) 2D belief maps
+            camera_K: (B, 3, 3) camera intrinsic matrix (required for depth_only)
+            heatmap_size: (H, W) tuple of heatmap resolution
+            original_size: (W, H) tuple of original image resolution
+        Returns:
+            pred_kpts_3d: (B, NUM_JOINTS, 3) predicted 3D coordinates
+        """
         b, n, d = dino_features.shape
         h = w = int(math.sqrt(n))
 
         feat_map = dino_features.permute(0, 2, 1).reshape(b, d, h, w)
 
-        # Spatial Softmax Pooling
+        # Extract 2D keypoint locations from heatmaps
+        uv_heatmap = soft_argmax_2d(predicted_heatmaps)  # (B, NJ, 2) in heatmap pixels
+
+        # Normalize 2D coords to [-1, 1] for feature input
+        hm_h, hm_w = predicted_heatmaps.shape[2], predicted_heatmaps.shape[3]
+        uv_normalized = uv_heatmap.clone()
+        uv_normalized[:, :, 0] = (uv_normalized[:, :, 0] / hm_w) * 2.0 - 1.0
+        uv_normalized[:, :, 1] = (uv_normalized[:, :, 1] / hm_h) * 2.0 - 1.0  # (B, NJ, 2)
+
+        # Spatial Softmax Pooling for visual features
         weights = F.interpolate(predicted_heatmaps, size=(h, w), mode='bilinear', align_corners=False)
         weights = torch.clamp(weights, min=0)
 
@@ -173,6 +257,9 @@ class Keypoint3DHead(nn.Module):
         weights_norm = weights_norm.reshape(b, self.num_joints, h, w)
 
         joint_features = torch.einsum('bdhw,bjhw->bjd', feat_map, weights_norm)  # (B, NJ, D)
+
+        # Concatenate explicit 2D coordinates to visual features
+        joint_features = torch.cat([joint_features, uv_normalized], dim=-1)  # (B, NJ, D+2)
 
         # 1. Feature refinement
         refined_features = self.joint_feature_net(joint_features)  # (B, NJ, 256)
@@ -186,15 +273,49 @@ class Keypoint3DHead(nn.Module):
         # 3. Learn inter-joint kinematic relations
         related_features = self.joint_relation_net(refined_features)  # (B, NJ, 256)
 
-        # 4. 3D coordinate regression
-        pred_kpts_3d = self.coord_predictor(related_features)  # (B, NJ, 3)
+        # 4. Predict 3D coordinates (mean pose + residual)
+        mean = self.mean_pose.unsqueeze(0).expand(b, -1, -1)  # (B, NJ, 3)
+
+        if self.mode == MODE_DEPTH_ONLY:
+            # Predict depth residual only
+            pred_dz = self.depth_predictor(related_features).squeeze(-1)  # (B, NJ)
+            pred_z = mean[:, :, 2] + pred_dz  # (B, NJ)
+
+            # Scale 2D coords to original image pixels
+            assert heatmap_size is not None and original_size is not None, \
+                "heatmap_size and original_size required for depth_only mode"
+
+            scale_x = original_size[0] / heatmap_size[1]
+            scale_y = original_size[1] / heatmap_size[0]
+
+            u_orig = uv_heatmap[:, :, 0] * scale_x
+            v_orig = uv_heatmap[:, :, 1] * scale_y
+
+            # Unproject using camera intrinsics
+            assert camera_K is not None, "camera_K required for depth_only mode"
+            fx = camera_K[:, 0, 0]
+            fy = camera_K[:, 1, 1]
+            cx = camera_K[:, 0, 2]
+            cy = camera_K[:, 1, 2]
+
+            pred_x = (u_orig - cx.unsqueeze(1)) * pred_z / fx.unsqueeze(1)
+            pred_y = (v_orig - cy.unsqueeze(1)) * pred_z / fy.unsqueeze(1)
+
+            pred_kpts_3d = torch.stack([pred_x, pred_y, pred_z], dim=-1)
+        else:
+            # Predict residual from mean pose
+            residual = self.coord_predictor(related_features)  # (B, NJ, 3)
+            pred_kpts_3d = mean + residual
 
         return pred_kpts_3d
 
 class DINOv3PoseEstimator(nn.Module):
-    def __init__(self, dino_model_name, heatmap_size, unfreeze_blocks=2, use_joint_embedding=False):
+    def __init__(self, dino_model_name, heatmap_size, unfreeze_blocks=2,
+                 use_joint_embedding=False, mode_3d=MODE_DIRECT):
         super().__init__()
         self.dino_model_name = dino_model_name
+        self.heatmap_size = heatmap_size  # (H, W) tuple
+        self.mode_3d = mode_3d
         self.backbone = DINOv3Backbone(dino_model_name, unfreeze_blocks=unfreeze_blocks)
 
         if "siglip" in self.dino_model_name:
@@ -214,10 +335,17 @@ class DINOv3PoseEstimator(nn.Module):
         self.keypoint_3d_head = Keypoint3DHead(
             input_dim=feature_dim,
             num_joints=NUM_JOINTS,
-            use_joint_embedding=use_joint_embedding
+            use_joint_embedding=use_joint_embedding,
+            mode=mode_3d
         )
 
-    def forward(self, image_tensor_batch):
+    def forward(self, image_tensor_batch, camera_K=None, original_size=None):
+        """
+        Args:
+            image_tensor_batch: (B, 3, H, W) input images
+            camera_K: (B, 3, 3) camera intrinsics (required for depth_only mode)
+            original_size: (W, H) original image resolution (required for depth_only mode)
+        """
         # 1. Extract visual representations
         dino_features = self.backbone(image_tensor_batch)
 
@@ -225,7 +353,12 @@ class DINOv3PoseEstimator(nn.Module):
         predicted_heatmaps = self.keypoint_head(dino_features)
 
         # 3. Lift 2D representations to 3D spatial coordinates
-        predicted_kpts_3d = self.keypoint_3d_head(dino_features, predicted_heatmaps)
+        predicted_kpts_3d = self.keypoint_3d_head(
+            dino_features, predicted_heatmaps,
+            camera_K=camera_K,
+            heatmap_size=self.heatmap_size,
+            original_size=original_size
+        )
 
         return {
             'heatmaps_2d': predicted_heatmaps,

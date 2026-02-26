@@ -24,7 +24,7 @@ from tqdm import tqdm
 import yaml
 import wandb
 
-from model import DINOv3PoseEstimator
+from model import DINOv3PoseEstimator, MODE_DIRECT, MODE_DEPTH_ONLY
 from dataset import PoseEstimationDataset, create_dataloaders
 
 import sys
@@ -93,19 +93,17 @@ class UnifiedPoseLoss(nn.Module):
         else:
             loss_heatmap = self.heatmap_loss(pred_dict['heatmaps_2d'], gt_dict['heatmaps_2d'])
 
-        # 2. 3D Keypoint Loss (Standard SmoothL1) - with masking
+        # 2. 3D Keypoint Loss (MSE) - with masking
         kp3d_pred = pred_dict['keypoints_3d']
         kp3d_gt = gt_dict['keypoints_3d']
 
         if valid_mask is not None:
             mask_expanded = valid_mask.unsqueeze(-1).float()  # (B, MAX_JOINTS, 1)
-            kp3d_diff = torch.nn.functional.smooth_l1_loss(
-                kp3d_pred, kp3d_gt, reduction='none'
-            )  # (B, MAX_JOINTS, 3)
+            kp3d_diff = (kp3d_pred - kp3d_gt) ** 2  # (B, MAX_JOINTS, 3)
             kp3d_diff_masked = kp3d_diff * mask_expanded
             loss_kp3d = kp3d_diff_masked.sum() / (mask_expanded.sum() + self.eps)
         else:
-            loss_kp3d = torch.nn.functional.smooth_l1_loss(
+            loss_kp3d = torch.nn.functional.mse_loss(
                 kp3d_pred, kp3d_gt, reduction='mean'
             )
 
@@ -307,8 +305,12 @@ class Trainer:
             gt_keypoints_3d = batch['keypoints_3d'].to(self.device)
             gt_valid_mask = batch['valid_mask'].to(self.device)
 
+            # Camera K and original size for depth_only mode
+            camera_K = batch['camera_K'].to(self.device) if 'camera_K' in batch else None
+            original_size = batch['original_size'][0].tolist() if 'original_size' in batch else None
+
             # Forward pass
-            pred_dict = self.model(images)
+            pred_dict = self.model(images, camera_K=camera_K, original_size=original_size)
 
             # Prepare ground truth dictionary
             gt_dict = {
@@ -393,8 +395,12 @@ class Trainer:
             gt_keypoints_3d = batch['keypoints_3d'].to(self.device)
             gt_valid_mask = batch['valid_mask'].to(self.device)
 
+            # Camera K and original size for depth_only mode
+            camera_K = batch['camera_K'].to(self.device) if 'camera_K' in batch else None
+            original_size = batch['original_size'][0].tolist() if 'original_size' in batch else None
+
             # Forward pass
-            pred_dict = self.model(images)
+            pred_dict = self.model(images, camera_K=camera_K, original_size=original_size)
 
             # Prepare ground truth dictionary
             gt_dict = {
@@ -409,7 +415,7 @@ class Trainer:
             # Record losses
             for key, value in loss_dict.items():
                 epoch_losses[key].append(value)
-                
+
             # Collect data for metrics
             if self.camera_K is not None:
                 # Extract coordinates from predicted heatmaps
@@ -839,11 +845,16 @@ def main(args):
             if is_main_process:
                 print(f"Warning: Failed to load camera settings: {e}")
 
+    mode_3d = MODE_DEPTH_ONLY if args.depth_only_3d else MODE_DIRECT
+    if is_main_process:
+        print(f"3D prediction mode: {mode_3d}")
+
     model = DINOv3PoseEstimator(
         dino_model_name=args.model_name,
         heatmap_size=(args.heatmap_size, args.heatmap_size),
         unfreeze_blocks=args.unfreeze_blocks,
-        use_joint_embedding=args.use_joint_embedding
+        use_joint_embedding=args.use_joint_embedding,
+        mode_3d=mode_3d
     ).to(device)
 
     # Wrap model with DistributedDataParallel for multi-GPU training
@@ -927,6 +938,7 @@ def main(args):
         'heatmap_size': args.heatmap_size,
         'unfreeze_blocks': args.unfreeze_blocks,
         'use_joint_embedding': args.use_joint_embedding,
+        'depth_only_3d': args.depth_only_3d,
         'batch_size': args.batch_size,
         'epochs': args.epochs,
         'optimizer': args.optimizer,
@@ -991,7 +1003,7 @@ if __name__ == '__main__':
 
     # Model
     parser.add_argument('--model-name', type=str,
-                        default='facebook/dinov2-base',
+                        default='facebook/dinov3-vitb16-pretrain-lvd1689m',
                         help='DINOv3 model name from HuggingFace')
     parser.add_argument('--image-size', type=int, default=512,
                         help='Input image size')
@@ -1001,6 +1013,8 @@ if __name__ == '__main__':
                         help='Number of backbone blocks to unfreeze')
     parser.add_argument('--use-joint-embedding', action='store_true', default=False,
                         help='Enable joint identity embeddings in 3D head for kinematic constraint learning')
+    parser.add_argument('--depth-only-3d', action='store_true', default=False,
+                        help='Predict only depth (z), recover x,y from 2D heatmap + camera K')
 
     # Training
     parser.add_argument('--epochs', type=int, default=100,

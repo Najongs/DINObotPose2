@@ -302,12 +302,15 @@ class PoseEstimationDataset(Dataset):
                             break
 
                 if img_path:
+                    # Detect synthetic data (DREAM sim uses cm, real uses m)
+                    is_synthetic = 'syn' in directory.lower()
                     samples.append({
                         'image_path': img_path,
                         'annotation_path': json_path,
                         'name': base_name,
                         'source_dir': os.path.basename(directory),
-                        'robot_type': robot_type
+                        'robot_type': robot_type,
+                        'is_synthetic': is_synthetic
                     })
 
         return samples
@@ -355,6 +358,13 @@ class PoseEstimationDataset(Dataset):
 
         keypoints['projections'] = keypoint_positions
         keypoints['locations'] = keypoint_positions_3d
+
+        # Camera intrinsic matrix K (from meta.K)
+        if 'meta' in data and 'K' in data['meta']:
+            keypoints['camera_K'] = np.array(data['meta']['K'], dtype=np.float32)
+        else:
+            # Default fallback (should not happen with proper data)
+            keypoints['camera_K'] = np.eye(3, dtype=np.float32)
 
         # Joint angles (있는 경우)
         if self.include_angles and 'joint_angles' in data:
@@ -444,11 +454,18 @@ class PoseEstimationDataset(Dataset):
         keypoints_tensor = torch.from_numpy(keypoints_scaled).float()
         keypoints_3d_tensor = torch.from_numpy(keypoints_data['locations']).float()
 
+        # Synthetic data (DREAM sim) uses cm, convert to meters
+        if sample_info.get('is_synthetic', False):
+            keypoints_3d_tensor = keypoints_3d_tensor / 100.0
+
         # Create valid mask (True for keypoints with valid coordinates)
         valid_mask = torch.tensor([kp[0] >= 0 and kp[1] >= 0 for kp in keypoints_scaled], dtype=torch.bool)
 
         # Get robot type from sample info
         robot_type = sample_info.get('robot_type', 0)  # Default to franka_panda if not found
+
+        # Camera intrinsic matrix
+        camera_K = torch.from_numpy(keypoints_data['camera_K']).float()  # (3, 3)
 
         sample = {
             'image': image_tensor,
@@ -457,7 +474,9 @@ class PoseEstimationDataset(Dataset):
             'keypoints_3d': keypoints_3d_tensor,
             'valid_mask': valid_mask,
             'robot_type': torch.tensor(robot_type, dtype=torch.long),
-            'name': sample_info['name']
+            'name': sample_info['name'],
+            'camera_K': camera_K,
+            'original_size': torch.tensor([original_size[0], original_size[1]], dtype=torch.float32),  # (W, H)
         }
 
         # Joint angles 포함 (있는 경우)

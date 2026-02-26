@@ -739,6 +739,72 @@ def cleanup_distributed():
         dist.destroy_process_group()
 
 
+def load_2d_head_weights(model, checkpoint_path, is_distributed=False, is_main_process=True):
+    """
+    Load pretrained 2D heatmap head (keypoint_head) weights from a checkpoint.
+
+    Args:
+        model: The model to load weights into (can be DDP-wrapped)
+        checkpoint_path: Path to the checkpoint file
+        is_distributed: Whether using distributed training
+        is_main_process: Whether this is the main process
+    """
+    if is_main_process:
+        print(f"\nLoading pretrained 2D heatmap head from: {checkpoint_path}")
+
+    # Load checkpoint
+    checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
+
+    # Get model state dict from checkpoint
+    if 'model_state_dict' in checkpoint:
+        state_dict = checkpoint['model_state_dict']
+    else:
+        state_dict = checkpoint
+
+    # Extract only keypoint_head weights
+    keypoint_head_state = {}
+    prefix = 'keypoint_head.'
+
+    # Handle both DDP (module.keypoint_head.) and non-DDP (keypoint_head.) prefixes
+    for key, value in state_dict.items():
+        if 'keypoint_head' in key:
+            # Remove 'module.' prefix if present (from DDP checkpoint)
+            clean_key = key.replace('module.', '')
+            # Extract the keypoint_head part
+            if clean_key.startswith(prefix):
+                # Keep the keypoint_head prefix
+                keypoint_head_state[clean_key] = value
+
+    if len(keypoint_head_state) == 0:
+        if is_main_process:
+            print("Warning: No keypoint_head weights found in checkpoint!")
+        return
+
+    # Get the actual model (unwrap DDP if needed)
+    actual_model = model.module if is_distributed else model
+
+    # Load the weights into the keypoint_head
+    try:
+        missing_keys, unexpected_keys = actual_model.load_state_dict(
+            keypoint_head_state, strict=False
+        )
+
+        if is_main_process:
+            print(f"Successfully loaded {len(keypoint_head_state)} keypoint_head parameters")
+            if missing_keys:
+                # Filter out non-keypoint_head missing keys (expected)
+                kp_missing = [k for k in missing_keys if 'keypoint_head' in k]
+                if kp_missing:
+                    print(f"Warning: Missing keypoint_head keys: {kp_missing}")
+            if unexpected_keys:
+                print(f"Warning: Unexpected keys: {unexpected_keys}")
+            print("2D heatmap head weights loaded successfully!")
+    except Exception as e:
+        if is_main_process:
+            print(f"Error loading 2D heatmap head weights: {e}")
+        raise
+
+
 def worker_init_fn(worker_id):
     """
     DataLoader worker initialization function for reproducibility
@@ -939,6 +1005,15 @@ def main(args):
         print(f"Number of parameters: {sum(p.numel() for p in model_to_count.parameters()):,}")
         print(f"Trainable parameters: {sum(p.numel() for p in model_to_count.parameters() if p.requires_grad):,}")
 
+    # Load pretrained 2D heatmap head weights if specified
+    if args.load_2d_head:
+        load_2d_head_weights(
+            model=model,
+            checkpoint_path=args.load_2d_head,
+            is_distributed=is_distributed,
+            is_main_process=is_main_process
+        )
+
     # Loss function
     angle_w = args.angle_weight if args.joint_angle_3d else 0.0
     fk_3d_w = args.fk_3d_weight if args.joint_angle_3d else 0.0
@@ -1131,6 +1206,10 @@ if __name__ == '__main__':
     # Resume
     parser.add_argument('--resume', type=str, default=None,
                         help='Path to checkpoint to resume from')
+
+    # Load pretrained 2D heatmap head
+    parser.add_argument('--load-2d-head', type=str, default=None,
+                        help='Path to checkpoint to load pretrained 2D heatmap head weights from')
 
     # Random seed
     parser.add_argument('--seed', type=int, default=42,

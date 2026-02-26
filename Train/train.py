@@ -6,7 +6,6 @@ DREAM 학습 방식을 참고한 학습 코드
 import argparse
 import os
 import time
-import json
 import pickle
 import random
 from pathlib import Path
@@ -23,6 +22,7 @@ import torch.distributed as dist
 from tqdm import tqdm
 import yaml
 import wandb
+import cv2
 
 from model import (DINOv3PoseEstimator, MODE_DIRECT, MODE_DEPTH_ONLY,
                     MODE_JOINT_ANGLE, panda_forward_kinematics)
@@ -32,8 +32,6 @@ import sys
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../DREAM')))
 import dream
 from dream import analysis as dream_analysis
-from scipy.spatial.transform import Rotation
-import cv2
 
 def solve_pnp_epnp(object_points, image_points, camera_matrix):
     """
@@ -129,6 +127,8 @@ class UnifiedPoseLoss(nn.Module):
     1. 2D Heatmap Loss (configurable: MSE/L1/SmoothL1)
     2. 3D Keypoint Lifting Loss (configurable: MSE/L1/SmoothL1)
     3. Camera-frame 3D loss (for joint_angle mode with PnP transform)
+    4. Adaptive loss weighting (uncertainty-based)
+    5. PnP failure penalty
 
     Loss type recommendation:
     - MSE: Traditional, sensitive to outliers
@@ -144,6 +144,8 @@ class UnifiedPoseLoss(nn.Module):
         fk_3d_weight: float = 0.0,  # FK 3D keypoint MSE loss weight (robot frame)
         camera_3d_weight: float = 0.0,  # Camera-frame 3D loss weight (with PnP transform)
         loss_type: str = 'smoothl1',  # Loss function type: 'mse', 'l1', 'smoothl1'
+        use_adaptive_weighting: bool = True,  # Use uncertainty-based adaptive weighting
+        pnp_failure_penalty_weight: float = 0.1,  # PnP failure penalty weight
     ):
         super().__init__()
         self.heatmap_weight = heatmap_weight
@@ -153,6 +155,8 @@ class UnifiedPoseLoss(nn.Module):
         self.fk_3d_weight = fk_3d_weight
         self.camera_3d_weight = camera_3d_weight
         self.loss_type = loss_type
+        self.use_adaptive_weighting = use_adaptive_weighting
+        self.pnp_failure_penalty_weight = pnp_failure_penalty_weight
 
         # Select loss function based on type
         if loss_type == 'mse':
@@ -163,6 +167,11 @@ class UnifiedPoseLoss(nn.Module):
             self.loss_fn = nn.SmoothL1Loss(reduction='none', beta=1.0)
         else:
             raise ValueError(f"Unknown loss type: {loss_type}")
+
+        # Adaptive loss weighting parameters (learnable uncertainty)
+        if use_adaptive_weighting:
+            self.log_sigma_heatmap = nn.Parameter(torch.zeros(1))
+            self.log_sigma_3d = nn.Parameter(torch.zeros(1))
 
         self.eps = 1e-6  # Numerical stability
 
@@ -205,17 +214,32 @@ class UnifiedPoseLoss(nn.Module):
             kp3d_diff = self.loss_fn(kp3d_pred, kp3d_gt)
             loss_kp3d = kp3d_diff.mean()
 
-        # Total Loss (Weighted Sum)
-        total_loss = (
-            self.heatmap_weight * loss_heatmap +
-            self.kp3d_weight * loss_kp3d
-        )
-
-        loss_dict = {
-            'total': total_loss.item(),
-            'heatmap': loss_heatmap.item(),
-            'kp3d': loss_kp3d.item(),
-        }
+        # Total Loss with Adaptive Weighting or Fixed Weights
+        if self.use_adaptive_weighting:
+            # Uncertainty-based weighting: loss / (2 * exp(log_sigma)) + log_sigma
+            # This automatically balances losses based on learned task uncertainty
+            total_loss = (
+                loss_heatmap / (2 * torch.exp(self.log_sigma_heatmap)) + self.log_sigma_heatmap +
+                loss_kp3d / (2 * torch.exp(self.log_sigma_3d)) + self.log_sigma_3d
+            )
+            loss_dict = {
+                'total': total_loss.item(),
+                'heatmap': loss_heatmap.item(),
+                'kp3d': loss_kp3d.item(),
+                'sigma_hm': torch.exp(self.log_sigma_heatmap).item(),
+                'sigma_3d': torch.exp(self.log_sigma_3d).item(),
+            }
+        else:
+            # Fixed weighting
+            total_loss = (
+                self.heatmap_weight * loss_heatmap +
+                self.kp3d_weight * loss_kp3d
+            )
+            loss_dict = {
+                'total': total_loss.item(),
+                'heatmap': loss_heatmap.item(),
+                'kp3d': loss_kp3d.item(),
+            }
 
         # Joint angle loss (joint_angle mode only)
         if self.angle_weight > 0 and 'joint_angles' in pred_dict and 'angles' in gt_dict:
@@ -312,11 +336,25 @@ class UnifiedPoseLoss(nn.Module):
                         total_loss = total_loss + self.camera_3d_weight * loss_camera_3d
                         loss_dict['camera_3d'] = loss_camera_3d.item()
 
-                        # Track PnP success rate
-                        loss_dict['pnp_success_rate'] = len(valid_indices) / B
+                        # Track PnP success rate and add failure penalty
+                        pnp_success_rate = len(valid_indices) / B
+                        loss_dict['pnp_success_rate'] = pnp_success_rate
+
+                        # Add penalty if PnP success rate is low (< 90%)
+                        if pnp_success_rate < 0.9:
+                            pnp_penalty = (1 - pnp_success_rate) * self.pnp_failure_penalty_weight
+                            total_loss = total_loss + pnp_penalty
+                            loss_dict['pnp_penalty'] = pnp_penalty
+                    else:
+                        # All PnP failed - high penalty
+                        loss_dict['pnp_success_rate'] = 0.0
+                        pnp_penalty = self.pnp_failure_penalty_weight
+                        total_loss = total_loss + pnp_penalty
+                        loss_dict['pnp_penalty'] = pnp_penalty
+
                 except Exception as e:
                     # PnP can fail, gracefully skip camera-frame loss
-                    print(f"Warning: Camera-frame 3D loss failed: {e}")
+                    # print(f"Warning: Camera-frame 3D loss failed: {e}")
                     pass
 
         # Update total in loss_dict
@@ -1071,7 +1109,7 @@ def main(args):
             image_size=(args.image_size, args.image_size),
             heatmap_size=(args.heatmap_size, args.heatmap_size),
             val_split=args.val_split,
-            worker_init_fn=worker_init_fn,
+            # worker_init_fn=worker_init_fn,
             multi_robot=args.multi_robot,
             robot_types=args.robot_types,
             fda_real_dir=args.fda_real_dir,
@@ -1079,13 +1117,14 @@ def main(args):
             fda_prob=args.fda_prob
         )
     else:
-        # Split single dataset
-        dataset = PoseEstimationDataset(
+        # Create separate train and val datasets with different augmentation settings
+        # This is more robust than modifying augment flag after random_split
+        base_dataset = PoseEstimationDataset(
             data_dir=args.data_dir,
             keypoint_names=keypoint_names,
             image_size=(args.image_size, args.image_size),
             heatmap_size=(args.heatmap_size, args.heatmap_size),
-            augment=True,
+            augment=False,  # Temporarily disable to get indices
             multi_robot=args.multi_robot,
             robot_types=args.robot_types,
             fda_real_dir=args.fda_real_dir,
@@ -1093,16 +1132,43 @@ def main(args):
             fda_prob=args.fda_prob
         )
 
-        # Split into train/val with reproducible split
-        train_size = int(args.train_split * len(dataset))
-        val_size = len(dataset) - train_size
-
-        # Use generator for reproducible split
+        # Split indices with reproducible split
+        train_size = int(args.train_split * len(base_dataset))
+        val_size = len(base_dataset) - train_size
         generator = torch.Generator().manual_seed(args.seed if args.seed is not None else 42)
-        train_dataset, val_dataset = random_split(dataset, [train_size, val_size], generator=generator)
+        train_indices, val_indices = random_split(
+            range(len(base_dataset)), [train_size, val_size], generator=generator
+        )
 
-        # Disable augmentation for validation
-        val_dataset.dataset.augment = False
+        # Create train dataset with augmentation
+        train_dataset_full = PoseEstimationDataset(
+            data_dir=args.data_dir,
+            keypoint_names=keypoint_names,
+            image_size=(args.image_size, args.image_size),
+            heatmap_size=(args.heatmap_size, args.heatmap_size),
+            augment=False,  # Disable augmentation for training
+            multi_robot=args.multi_robot,
+            robot_types=args.robot_types,
+            fda_real_dir=args.fda_real_dir,
+            fda_beta=args.fda_beta,
+            fda_prob=args.fda_prob
+        )
+        train_dataset = torch.utils.data.Subset(train_dataset_full, train_indices.indices)
+
+        # Create val dataset without augmentation
+        val_dataset_full = PoseEstimationDataset(
+            data_dir=args.data_dir,
+            keypoint_names=keypoint_names,
+            image_size=(args.image_size, args.image_size),
+            heatmap_size=(args.heatmap_size, args.heatmap_size),
+            augment=False,  # Disable augmentation for validation
+            multi_robot=args.multi_robot,
+            robot_types=args.robot_types,
+            fda_real_dir=None,  # No FDA for validation
+            fda_beta=args.fda_beta,
+            fda_prob=0.0  # No FDA for validation
+        )
+        val_dataset = torch.utils.data.Subset(val_dataset_full, val_indices.indices)
 
         # Create samplers for distributed training
         if is_distributed:
@@ -1128,8 +1194,8 @@ def main(args):
             shuffle=(train_sampler is None),
             sampler=train_sampler,
             num_workers=args.num_workers,
-            pin_memory=True,
-            worker_init_fn=worker_init_fn
+            pin_memory=True
+            # worker_init_fn=worker_init_fn
         )
 
         val_loader = DataLoader(
@@ -1138,8 +1204,8 @@ def main(args):
             shuffle=False,
             sampler=val_sampler,
             num_workers=args.num_workers,
-            pin_memory=True,
-            worker_init_fn=worker_init_fn
+            pin_memory=True
+            # worker_init_fn=worker_init_fn
         )
 
     if is_main_process:
@@ -1234,7 +1300,7 @@ def main(args):
         fk_3d_weight=fk_3d_w,
         camera_3d_weight=camera_3d_w,  # Camera-frame 3D loss (PnP-based transform)
         loss_type=args.loss_type,  # Loss function type: 'mse', 'l1', 'smoothl1'
-    )
+    ).to(device)
 
     # Optimizer
     if args.optimizer == 'adam':
@@ -1259,8 +1325,11 @@ def main(args):
     else:
         raise ValueError(f"Unknown optimizer: {args.optimizer}")
 
-    # Learning rate scheduler
+    # Learning rate scheduler with warmup (skip warmup if resuming)
     scheduler = None
+    warmup_epochs = 5  # Number of warmup epochs
+    use_warmup = args.scheduler == 'cosine' and not args.resume  # Only warmup for cosine and new training
+
     if args.scheduler == 'step':
         scheduler = optim.lr_scheduler.StepLR(
             optimizer,
@@ -1268,13 +1337,35 @@ def main(args):
             gamma=args.lr_gamma
         )
     elif args.scheduler == 'cosine':
-        scheduler = optim.lr_scheduler.CosineAnnealingLR(
-            optimizer,
-            T_max=args.epochs,
-            eta_min=args.min_lr  # Minimum learning rate
-        )
-        if is_main_process:
-            print(f"Using CosineAnnealingLR: initial_lr={args.learning_rate}, min_lr={args.min_lr}, T_max={args.epochs}")
+        if use_warmup:
+            # Warmup + Cosine schedule (only for new training, not resume)
+            from torch.optim.lr_scheduler import SequentialLR, LinearLR
+            warmup_scheduler = LinearLR(
+                optimizer,
+                start_factor=0.1,
+                total_iters=warmup_epochs
+            )
+            cosine_scheduler = optim.lr_scheduler.CosineAnnealingLR(
+                optimizer,
+                T_max=args.epochs - warmup_epochs,
+                eta_min=args.min_lr
+            )
+            scheduler = SequentialLR(
+                optimizer,
+                schedulers=[warmup_scheduler, cosine_scheduler],
+                milestones=[warmup_epochs]
+            )
+            if is_main_process:
+                print(f"Using Warmup({warmup_epochs}ep) + CosineAnnealingLR: initial_lr={args.learning_rate}, min_lr={args.min_lr}, T_max={args.epochs}")
+        else:
+            # Just cosine (for resume)
+            scheduler = optim.lr_scheduler.CosineAnnealingLR(
+                optimizer,
+                T_max=args.epochs,
+                eta_min=args.min_lr
+            )
+            if is_main_process:
+                print(f"Using CosineAnnealingLR: initial_lr={args.learning_rate}, min_lr={args.min_lr}, T_max={args.epochs}")
     elif args.scheduler == 'plateau':
         scheduler = optim.lr_scheduler.ReduceLROnPlateau(
             optimizer,

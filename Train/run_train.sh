@@ -8,8 +8,8 @@
 # =============================================================================
 
 # Data paths (REQUIRED - Update these paths!)
-# DATA_DIR="/data/public/NAS/DINObotPose2/Dataset/Converted_dataset/DREAM_to_DREAM_syn/panda_synth_train_dr"  # Training data directory
-DATA_DIR="/home/najo/NAS/DIP/2025_ICRA_Multi_View_Robot_Pose_Estimation/dataset/Converted_dataset/DREAM_to_DREAM_syn/panda_synth_train_dr"  # Training data directory
+DATA_DIR="/data/public/NAS/DINObotPose2/Dataset/Converted_dataset/DREAM_to_DREAM_syn/panda_synth_train_dr"  # Training data directory
+# DATA_DIR="/home/najo/NAS/DIP/2025_ICRA_Multi_View_Robot_Pose_Estimation/dataset/Converted_dataset/DREAM_to_DREAM_syn/panda_synth_train_dr"  # Training data directory
 TRAIN_SPLIT=0.9  # Train/Val split ratio (0.9 = 90% train, 10% val)
 
 # Model configuration
@@ -27,8 +27,8 @@ ANGLE_WEIGHT=1.0     # Joint angle MSE loss weight
 FK_3D_WEIGHT=10.0    # FK 3D keypoint MSE loss weight (robot frame)
 
 # FDA (Fourier Domain Adaptation) for sim-to-real
-# FDA_REAL_DIR="/data/public/NAS/DINObotPose2/Dataset/DREAM_real"  # Real images (no labels needed)
-FDA_REAL_DIR="/home/najo/NAS/DIP/2025_ICRA_Multi_View_Robot_Pose_Estimation/dataset/DREAM_real"
+FDA_REAL_DIR="/data/public/NAS/DINObotPose2/Dataset/DREAM_real"  # Real images (no labels needed)
+# FDA_REAL_DIR="/home/najo/NAS/DIP/2025_ICRA_Multi_View_Robot_Pose_Estimation/dataset/DREAM_real"
 FDA_BETA=0.001   # Low-freq replacement ratio (0.01=subtle tone shift, 0.05=strong)
 FDA_PROB=0.5    # Probability of applying FDA per sample (0.0 to disable)
 
@@ -54,7 +54,7 @@ WANDB_RUN_NAME="dinov3_base_$(date +%Y%m%d_%H%M%S)"
 # Other settings
 SEED=42
 RESUME=""  # Path to checkpoint for resuming (leave empty for new training)
-LOAD_2D_HEAD="/home/najo/NAS/DIP/DINObotPose2/Train/outputs/dinov3_base_20260225_205248/best_model.pth"  # Path to checkpoint for loading pretrained 2D heatmap head (leave empty to train from scratch)
+LOAD_2D_HEAD="/data/public/NAS/DINObotPose2/Train/outputs/dinov3_base_20260225_231442/best_model.pth"  # Path to checkpoint for loading pretrained 2D heatmap head (leave empty to train from scratch)
 
 # =============================================================================
 # Training Modes

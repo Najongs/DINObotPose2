@@ -28,7 +28,7 @@ from dream import analysis as dream_analysis
 
 # Import model from TRAIN directory
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../Train')))
-from model import DINOv3PoseEstimator, MODE_DIRECT, MODE_DEPTH_ONLY
+from model import DINOv3PoseEstimator, MODE_DIRECT, MODE_DEPTH_ONLY, MODE_JOINT_ANGLE
 
 
 class InferenceDataset(Dataset):
@@ -135,6 +135,36 @@ def get_keypoints_from_heatmaps(heatmaps: torch.Tensor) -> np.ndarray:
 
     keypoints = torch.stack([x, y], dim=-1).float()
     return keypoints.cpu().numpy()
+
+
+def transform_robot_to_camera(robot_kpts, pred_2d, camera_K):
+    """
+    Transform robot frame keypoints to camera frame using PnP.
+
+    Args:
+        robot_kpts: (N, 3) keypoints in robot frame
+        pred_2d: (N, 2) predicted 2D keypoints in image
+        camera_K: (3, 3) camera intrinsic matrix
+
+    Returns:
+        camera_kpts: (N, 3) keypoints in camera frame (or None if PnP fails)
+    """
+    # Solve PnP to get robot-to-camera transform
+    pnp_retval, translation, quaternion = dream.geometric_vision.solve_pnp(
+        robot_kpts, pred_2d, camera_K
+    )
+
+    if not pnp_retval:
+        return None
+
+    # Convert quaternion to rotation matrix
+    from scipy.spatial.transform import Rotation
+    R = Rotation.from_quat(quaternion).as_matrix()  # (3, 3)
+
+    # Transform: camera_frame = R @ robot_frame + t
+    camera_kpts = (R @ robot_kpts.T).T + translation.reshape(1, 3)
+
+    return camera_kpts
 
 
 def compute_keypoint_metrics(
@@ -430,12 +460,20 @@ def run_inference(args):
     heatmap_size = args.heatmap_size or int(train_config.get('heatmap_size', 512))
     use_joint_embedding = train_config.get('use_joint_embedding', False)
     depth_only_3d = train_config.get('depth_only_3d', False)
-    mode_3d = MODE_DEPTH_ONLY if depth_only_3d else MODE_DIRECT
+    joint_angle_3d = train_config.get('joint_angle_3d', False)
+
+    # Determine 3D prediction mode
+    if joint_angle_3d:
+        mode_3d = MODE_JOINT_ANGLE
+    elif depth_only_3d:
+        mode_3d = MODE_DEPTH_ONLY
+    else:
+        mode_3d = MODE_DIRECT
 
     print(f"  model_name: {model_name}")
     print(f"  image_size: {image_size}, heatmap_size: {heatmap_size}")
     print(f"  use_joint_embedding: {use_joint_embedding}")
-    print(f"  depth_only_3d: {depth_only_3d} (mode: {mode_3d})")
+    print(f"  depth_only_3d: {depth_only_3d}, joint_angle_3d: {joint_angle_3d} (mode: {mode_3d})")
 
     # Create dataset
     dataset = InferenceDataset(
@@ -529,10 +567,18 @@ def run_inference(args):
             pred_kp_scaled[:, 0] *= scale_x
             pred_kp_scaled[:, 1] *= scale_y
 
+            # Transform 3D predictions from robot frame to camera frame if MODE_JOINT_ANGLE
+            pred_3d_sample = pred_kpts_3d[i]
+            if mode_3d == MODE_JOINT_ANGLE and camera_K is not None:
+                pred_3d_camera = transform_robot_to_camera(pred_3d_sample, pred_kp_scaled, camera_K)
+                if pred_3d_camera is not None:
+                    pred_3d_sample = pred_3d_camera
+                # If PnP fails, keep robot frame coordinates (will be flagged in metrics)
+
             all_kp_projs_detected.append(pred_kp_scaled)
             all_kp_projs_gt.append(gt_keypoints[i])
             all_kp_pos_gt.append(gt_keypoints_3d[i])
-            all_pred_3d.append(pred_kpts_3d[i])
+            all_pred_3d.append(pred_3d_sample)
 
             # Count in-frame GT keypoints
             n_inframe = 0
@@ -609,6 +655,9 @@ def run_inference(args):
 
     print(f"\nDataset: {args.dataset_dir}")
     print(f"Model: {args.model_path}")
+    print(f"3D Prediction Mode: {mode_3d}")
+    if mode_3d == MODE_JOINT_ANGLE:
+        print("  (Robot frame → Camera frame via PnP transformation)")
     print(f"Number of frames: {n_samples}")
 
     # 2D Keypoint metrics

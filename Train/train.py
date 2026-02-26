@@ -32,6 +32,7 @@ import sys
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../DREAM')))
 import dream
 from dream import analysis as dream_analysis
+from scipy.spatial.transform import Rotation
 
 def get_keypoints_from_heatmaps(heatmaps):
     """
@@ -49,11 +50,37 @@ def get_keypoints_from_heatmaps(heatmaps):
     return torch.stack([x, y], dim=-1).float()
 
 
+def soft_argmax_2d(heatmaps, temperature=10.0):
+    """
+    Differentiable soft-argmax to extract (u, v) from heatmaps for PnP.
+    Args:
+        heatmaps: (B, N, H, W)
+        temperature: scaling factor for softmax sharpness
+    Returns:
+        (B, N, 2) [x, y] coordinates in heatmap pixel space
+    """
+    B, N, H, W = heatmaps.shape
+    device = heatmaps.device
+
+    x_coords = torch.arange(W, device=device, dtype=torch.float32)
+    y_coords = torch.arange(H, device=device, dtype=torch.float32)
+
+    heatmaps_flat = heatmaps.reshape(B, N, -1)
+    weights = torch.softmax(heatmaps_flat * temperature, dim=-1)
+    weights = weights.reshape(B, N, H, W)
+
+    x = (weights.sum(dim=2) * x_coords).sum(dim=-1)  # (B, N)
+    y = (weights.sum(dim=3) * y_coords).sum(dim=-1)  # (B, N)
+
+    return torch.stack([x, y], dim=-1)  # (B, N, 2)
+
+
 class UnifiedPoseLoss(nn.Module):
     """
     Multi-task loss for Pose Estimation:
     1. 2D Heatmap Loss (MSE)
     2. 3D Keypoint Lifting Loss (SmoothL1)
+    3. Camera-frame 3D loss (for joint_angle mode with PnP transform)
     """
     def __init__(
         self,
@@ -62,6 +89,7 @@ class UnifiedPoseLoss(nn.Module):
         heatmap_size: int = 512,
         angle_weight: float = 0.0,  # Joint angle MSE loss weight
         fk_3d_weight: float = 0.0,  # FK 3D keypoint MSE loss weight (robot frame)
+        camera_3d_weight: float = 0.0,  # Camera-frame 3D loss weight (with PnP transform)
     ):
         super().__init__()
         self.heatmap_weight = heatmap_weight
@@ -69,6 +97,7 @@ class UnifiedPoseLoss(nn.Module):
         self.heatmap_size = heatmap_size
         self.angle_weight = angle_weight
         self.fk_3d_weight = fk_3d_weight
+        self.camera_3d_weight = camera_3d_weight
 
         self.heatmap_loss = nn.MSELoss()
         self.eps = 1e-6  # Numerical stability
@@ -140,6 +169,83 @@ class UnifiedPoseLoss(nn.Module):
             loss_fk_3d = torch.nn.functional.mse_loss(pred_kp_robot, gt_kp_robot)
             total_loss = total_loss + self.fk_3d_weight * loss_fk_3d
             loss_dict['fk_3d'] = loss_fk_3d.item()
+
+        # Camera-frame 3D loss: Transform robot-frame to camera-frame using PnP
+        if self.camera_3d_weight > 0 and 'joint_angles' in pred_dict and 'keypoints_3d_robot' in pred_dict:
+            if 'keypoints' in gt_dict and 'camera_K' in gt_dict and 'original_size' in gt_dict:
+                try:
+                    pred_kp_robot = pred_dict['keypoints_3d_robot']  # (B, 7, 3)
+                    gt_kp_camera = gt_dict['keypoints_3d']  # (B, 7, 3) camera frame
+                    gt_kp_2d = gt_dict['keypoints']  # (B, 7, 2) pixel coordinates
+                    camera_K = gt_dict['camera_K']  # (B, 3, 3)
+                    original_size = gt_dict['original_size']  # (B, 2) [W, H]
+                    valid_mask = gt_dict.get('valid_mask', None)  # (B, 7)
+
+                    # Extract 2D keypoints from predicted heatmaps using soft-argmax
+                    pred_heatmaps = pred_dict['heatmaps_2d']  # (B, 7, H, W)
+                    pred_kp_2d_heatmap = soft_argmax_2d(pred_heatmaps)  # (B, 7, 2) in heatmap coords
+
+                    # Scale to original image coordinates
+                    H_hm, W_hm = pred_heatmaps.shape[2], pred_heatmaps.shape[3]
+                    scale_x = original_size[:, 0:1] / W_hm  # (B, 1)
+                    scale_y = original_size[:, 1:2] / H_hm  # (B, 1)
+                    pred_kp_2d = pred_kp_2d_heatmap.clone()
+                    pred_kp_2d[:, :, 0] = pred_kp_2d[:, :, 0] * scale_x
+                    pred_kp_2d[:, :, 1] = pred_kp_2d[:, :, 1] * scale_y
+
+                    # Transform robot-frame to camera-frame using GT-based PnP (for stability)
+                    B = pred_kp_robot.shape[0]
+                    pred_kp_camera_list = []
+
+                    for b in range(B):
+                        # Use GT robot-frame (from FK) for PnP to get stable transform
+                        gt_angles_b = gt_dict['angles'][b]  # (7,)
+                        gt_kp_robot_b = panda_forward_kinematics(gt_angles_b.unsqueeze(0))[0]  # (7, 3)
+                        gt_kp_2d_b = gt_kp_2d[b]  # (7, 2)
+                        camera_K_b = camera_K[b]  # (3, 3)
+
+                        # Convert to numpy for PnP
+                        gt_kp_robot_np = gt_kp_robot_b.detach().cpu().numpy()
+                        gt_kp_2d_np = gt_kp_2d_b.detach().cpu().numpy()
+                        camera_K_np = camera_K_b.detach().cpu().numpy()
+
+                        # Solve PnP to get robot-to-camera transform
+                        pnp_retval, translation, quaternion = dream.geometric_vision.solve_pnp(
+                            gt_kp_robot_np, gt_kp_2d_np, camera_K_np
+                        )
+
+                        if pnp_retval:
+                            # Convert quaternion to rotation matrix
+                            R = Rotation.from_quat(quaternion).as_matrix()  # (3, 3)
+                            R_tensor = torch.from_numpy(R).float().to(pred_kp_robot.device)
+                            t_tensor = torch.from_numpy(translation).float().to(pred_kp_robot.device)
+
+                            # Transform predicted robot-frame to camera-frame
+                            pred_kp_robot_b = pred_kp_robot[b]  # (7, 3)
+                            pred_kp_camera_b = (R_tensor @ pred_kp_robot_b.T).T + t_tensor  # (7, 3)
+                            pred_kp_camera_list.append(pred_kp_camera_b)
+                        else:
+                            # PnP failed, skip this sample
+                            pred_kp_camera_list.append(pred_kp_robot[b])  # Use robot frame as fallback
+
+                    if len(pred_kp_camera_list) > 0:
+                        pred_kp_camera = torch.stack(pred_kp_camera_list, dim=0)  # (B, 7, 3)
+
+                        # Compute loss in camera frame
+                        if valid_mask is not None:
+                            mask_expanded = valid_mask.unsqueeze(-1).float()  # (B, 7, 1)
+                            camera_3d_diff = (pred_kp_camera - gt_kp_camera) ** 2
+                            camera_3d_diff_masked = camera_3d_diff * mask_expanded
+                            loss_camera_3d = camera_3d_diff_masked.sum() / (mask_expanded.sum() + self.eps)
+                        else:
+                            loss_camera_3d = torch.nn.functional.mse_loss(pred_kp_camera, gt_kp_camera)
+
+                        total_loss = total_loss + self.camera_3d_weight * loss_camera_3d
+                        loss_dict['camera_3d'] = loss_camera_3d.item()
+                except Exception as e:
+                    # PnP can fail, gracefully skip camera-frame loss
+                    print(f"Warning: Camera-frame 3D loss failed: {e}")
+                    pass
 
         # Update total in loss_dict
         loss_dict['total'] = total_loss.item()
@@ -329,16 +435,18 @@ class Trainer:
             gt_heatmaps = batch['heatmaps'].to(self.device)
             gt_keypoints_3d = batch['keypoints_3d'].to(self.device)
             gt_valid_mask = batch['valid_mask'].to(self.device)
+            gt_keypoints_2d = batch['keypoints'].to(self.device) if 'keypoints' in batch else None
 
-            # Camera K and original size for depth_only mode
+            # Camera K and original size for depth_only and joint_angle modes
             camera_K = batch['camera_K'].to(self.device) if 'camera_K' in batch else None
-            original_size = batch['original_size'][0].tolist() if 'original_size' in batch else None
+            original_size = batch['original_size'] if 'original_size' in batch else None
 
             # Joint angles for joint_angle mode
             gt_angles = batch['angles'].to(self.device) if 'angles' in batch else None
 
             # Forward pass
-            pred_dict = self.model(images, camera_K=camera_K, original_size=original_size)
+            orig_size_list = original_size[0].tolist() if original_size is not None else None
+            pred_dict = self.model(images, camera_K=camera_K, original_size=orig_size_list)
 
             # Prepare ground truth dictionary
             gt_dict = {
@@ -348,6 +456,12 @@ class Trainer:
             }
             if gt_angles is not None:
                 gt_dict['angles'] = gt_angles
+            if gt_keypoints_2d is not None:
+                gt_dict['keypoints'] = gt_keypoints_2d
+            if camera_K is not None:
+                gt_dict['camera_K'] = camera_K
+            if original_size is not None:
+                gt_dict['original_size'] = original_size
 
             # Compute loss
             loss, loss_dict = self.criterion(pred_dict, gt_dict)
@@ -375,6 +489,8 @@ class Trainer:
                     postfix['ang'] = f"{loss_dict['angle']:.6f}"
                 if 'fk_3d' in loss_dict:
                     postfix['fk'] = f"{loss_dict['fk_3d']:.6f}"
+                if 'camera_3d' in loss_dict:
+                    postfix['cam3d'] = f"{loss_dict['camera_3d']:.6f}"
                 pbar.set_postfix(postfix)
 
                 # Log batch losses to wandb every N batches
@@ -430,16 +546,18 @@ class Trainer:
             gt_heatmaps = batch['heatmaps'].to(self.device)
             gt_keypoints_3d = batch['keypoints_3d'].to(self.device)
             gt_valid_mask = batch['valid_mask'].to(self.device)
+            gt_keypoints_2d = batch['keypoints'].to(self.device) if 'keypoints' in batch else None
 
-            # Camera K and original size for depth_only mode
+            # Camera K and original size for depth_only and joint_angle modes
             camera_K = batch['camera_K'].to(self.device) if 'camera_K' in batch else None
-            original_size = batch['original_size'][0].tolist() if 'original_size' in batch else None
+            original_size = batch['original_size'] if 'original_size' in batch else None
 
             # Joint angles for joint_angle mode
             gt_angles = batch['angles'].to(self.device) if 'angles' in batch else None
 
             # Forward pass
-            pred_dict = self.model(images, camera_K=camera_K, original_size=original_size)
+            orig_size_list = original_size[0].tolist() if original_size is not None else None
+            pred_dict = self.model(images, camera_K=camera_K, original_size=orig_size_list)
 
             # Prepare ground truth dictionary
             gt_dict = {
@@ -449,6 +567,12 @@ class Trainer:
             }
             if gt_angles is not None:
                 gt_dict['angles'] = gt_angles
+            if gt_keypoints_2d is not None:
+                gt_dict['keypoints'] = gt_keypoints_2d
+            if camera_K is not None:
+                gt_dict['camera_K'] = camera_K
+            if original_size is not None:
+                gt_dict['original_size'] = original_size
 
             # Compute loss
             _, loss_dict = self.criterion(pred_dict, gt_dict)
@@ -497,6 +621,8 @@ class Trainer:
                     postfix['ang'] = f"{loss_dict['angle']:.6f}"
                 if 'fk_3d' in loss_dict:
                     postfix['fk'] = f"{loss_dict['fk_3d']:.6f}"
+                if 'camera_3d' in loss_dict:
+                    postfix['cam3d'] = f"{loss_dict['camera_3d']:.6f}"
                 pbar.set_postfix(postfix)
 
         # Average losses
@@ -638,10 +764,14 @@ class Trainer:
                     train_extra += f", ang: {train_losses['angle']:.6f}"
                 if 'fk_3d' in train_losses:
                     train_extra += f", fk: {train_losses['fk_3d']:.6f}"
+                if 'camera_3d' in train_losses:
+                    train_extra += f", cam3d: {train_losses['camera_3d']:.6f}"
                 if 'angle' in val_losses:
                     val_extra += f", ang: {val_losses['angle']:.6f}"
                 if 'fk_3d' in val_losses:
                     val_extra += f", fk: {val_losses['fk_3d']:.6f}"
+                if 'camera_3d' in val_losses:
+                    val_extra += f", cam3d: {val_losses['camera_3d']:.6f}"
                 print(f"  Train Loss: {train_losses['total']:.6f} (hm: {train_losses['heatmap']:.6f}, kp3d: {train_losses['kp3d']:.6f}{train_extra})")
                 print(f"  Val Loss:   {val_losses['total']:.6f} (hm: {val_losses['heatmap']:.6f}, kp3d: {val_losses['kp3d']:.6f}{val_extra})")
                 if 'val_pck_auc' in val_losses:
@@ -1017,12 +1147,14 @@ def main(args):
     # Loss function
     angle_w = args.angle_weight if args.joint_angle_3d else 0.0
     fk_3d_w = args.fk_3d_weight if args.joint_angle_3d else 0.0
+    camera_3d_w = args.kp3d_weight if args.joint_angle_3d else 0.0  # Use kp3d_weight for camera-frame 3D loss in joint_angle mode
     criterion = UnifiedPoseLoss(
         heatmap_weight=args.heatmap_weight,
-        kp3d_weight=args.kp3d_weight if not args.joint_angle_3d else 0.0,  # disable camera-frame 3D loss in joint_angle mode
+        kp3d_weight=args.kp3d_weight if not args.joint_angle_3d else 0.0,  # disable for non-joint_angle modes
         heatmap_size=args.heatmap_size,
         angle_weight=angle_w,
         fk_3d_weight=fk_3d_w,
+        camera_3d_weight=camera_3d_w,  # Camera-frame 3D loss (PnP-based transform)
     )
 
     # Optimizer

@@ -67,8 +67,8 @@ LOAD_2D_HEAD="/data/public/NAS/DINObotPose2/Train/outputs/dinov3_base_20260225_2
 
 # --- Multi-GPU Training (Distributed Data Parallel) ---
 TRAIN_MODE="multi_gpu"
-NUM_GPUS=3  # 사용할 GPU 개수 (single GPU는 1로 설정)
-GPU_IDS="0,1,2"  # 사용할 GPU ID (예: "0,1,2,3")
+NUM_GPUS=5  # 사용할 GPU 개수 (single GPU는 1로 설정)
+GPU_IDS="0,1,2,3,4"  # 사용할 GPU ID (예: "0,1,2,3")
 
 # =============================================================================
 # Execute Training

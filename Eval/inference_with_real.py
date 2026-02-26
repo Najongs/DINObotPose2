@@ -23,7 +23,7 @@ import dream
 
 # Import model from Train directory
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../Train')))
-from model import DINOv3PoseEstimator, MODE_DIRECT, MODE_DEPTH_ONLY
+from model import DINOv3PoseEstimator, MODE_DIRECT, MODE_DEPTH_ONLY, MODE_JOINT_ANGLE
 
 
 def get_keypoints_from_heatmaps(heatmaps_tensor):
@@ -35,6 +35,36 @@ def get_keypoints_from_heatmaps(heatmaps_tensor):
     x = max_indices % W
     keypoints = torch.stack([x, y], dim=-1).float()
     return keypoints[0].cpu().numpy()
+
+
+def transform_robot_to_camera(robot_kpts, pred_2d, camera_K):
+    """
+    Transform robot frame keypoints to camera frame using PnP.
+
+    Args:
+        robot_kpts: (N, 3) keypoints in robot frame
+        pred_2d: (N, 2) predicted 2D keypoints in image
+        camera_K: (3, 3) camera intrinsic matrix
+
+    Returns:
+        camera_kpts: (N, 3) keypoints in camera frame (or None if PnP fails)
+    """
+    # Solve PnP to get robot-to-camera transform
+    pnp_retval, translation, quaternion = dream.geometric_vision.solve_pnp(
+        robot_kpts, pred_2d, camera_K
+    )
+
+    if not pnp_retval:
+        return None
+
+    # Convert quaternion to rotation matrix
+    from scipy.spatial.transform import Rotation
+    R = Rotation.from_quat(quaternion).as_matrix()  # (3, 3)
+
+    # Transform: camera_frame = R @ robot_frame + t
+    camera_kpts = (R @ robot_kpts.T).T + translation.reshape(1, 3)
+
+    return camera_kpts
 
 
 def load_annotation(json_path, keypoint_names):
@@ -146,6 +176,7 @@ def network_inference(args):
 
     use_joint_embedding = False
     depth_only_3d = False
+    joint_angle_3d = False
     model_name = args.model_name
     image_size = 512
     heatmap_size = 512
@@ -155,12 +186,13 @@ def network_inference(args):
             train_config = yaml.safe_load(f)
         use_joint_embedding = train_config.get('use_joint_embedding', False)
         depth_only_3d = train_config.get('depth_only_3d', False)
+        joint_angle_3d = train_config.get('joint_angle_3d', False)
         model_name = train_config.get('model_name', model_name)
         image_size = int(train_config.get('image_size', image_size))
         heatmap_size = int(train_config.get('heatmap_size', heatmap_size))
         if 'keypoint_names' in train_config:
             keypoint_names = train_config['keypoint_names']
-        print(f"# Config: use_joint_embedding={use_joint_embedding}, depth_only_3d={depth_only_3d}")
+        print(f"# Config: use_joint_embedding={use_joint_embedding}, depth_only_3d={depth_only_3d}, joint_angle_3d={joint_angle_3d}")
 
     # Load annotation JSON
     print(f"\n# Loading annotation: {args.json_path}")
@@ -176,8 +208,13 @@ def network_inference(args):
     if camera_K is not None:
         print(f"# Camera K:\n{camera_K}")
 
-    # Create model
-    mode_3d = MODE_DEPTH_ONLY if depth_only_3d else MODE_DIRECT
+    # Create model with correct mode
+    if joint_angle_3d:
+        mode_3d = MODE_JOINT_ANGLE
+    elif depth_only_3d:
+        mode_3d = MODE_DEPTH_ONLY
+    else:
+        mode_3d = MODE_DIRECT
     model = DINOv3PoseEstimator(
         dino_model_name=model_name,
         heatmap_size=(heatmap_size, heatmap_size),
@@ -235,8 +272,25 @@ def network_inference(args):
     pred_2d_orig[:, 0] *= orig_dim[0] / heatmap_size
     pred_2d_orig[:, 1] *= orig_dim[1] / heatmap_size
 
-    # 3D predictions
-    pred_3d = pred_kpts_3d[0].cpu().numpy()
+    # 3D predictions - handle different modes
+    pred_3d_raw = pred_kpts_3d[0].cpu().numpy()
+
+    # If MODE_JOINT_ANGLE, transform from robot frame to camera frame
+    if mode_3d == MODE_JOINT_ANGLE:
+        if camera_K is not None:
+            print("# Transforming robot frame → camera frame using PnP...")
+            pred_3d = transform_robot_to_camera(pred_3d_raw, pred_2d_orig, camera_K)
+            if pred_3d is None:
+                print("# Warning: PnP failed, using robot frame coordinates (comparison with GT will be invalid)")
+                pred_3d = pred_3d_raw
+            else:
+                print("# Successfully transformed to camera frame")
+        else:
+            print("# Warning: No camera K available, using robot frame coordinates (comparison with GT will be invalid)")
+            pred_3d = pred_3d_raw
+    else:
+        # MODE_DIRECT or MODE_DEPTH_ONLY already output camera frame coordinates
+        pred_3d = pred_3d_raw
 
     # === Compute Metrics ===
     metrics = compute_metrics(pred_2d_orig, gt_2d, pred_3d, gt_3d, keypoint_names, found, orig_dim)

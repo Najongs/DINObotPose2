@@ -10,6 +10,7 @@ NUM_JOINTS = 7  # DO NOT CHANGE: This value is intentionally set to 7.
 # 3D prediction modes
 MODE_DIRECT = 'direct'        # Predict (x, y, z) directly from features
 MODE_DEPTH_ONLY = 'depth_only'  # Predict z only, recover x,y from 2D heatmap + camera K
+MODE_JOINT_ANGLE = 'joint_angle'  # Predict joint angles → FK → robot-frame 3D keypoints
 
 
 def soft_argmax_2d(heatmaps, temperature=10.0):
@@ -309,6 +310,281 @@ class Keypoint3DHead(nn.Module):
 
         return pred_kpts_3d
 
+# =============================================================================
+# Forward Kinematics (Panda robot, URDF-based DH parameters)
+# =============================================================================
+
+def _rotation_matrix_z(theta):
+    """Rotation matrix around Z axis. theta: (B,) or (B,1)"""
+    c = torch.cos(theta)
+    s = torch.sin(theta)
+    zero = torch.zeros_like(c)
+    one = torch.ones_like(c)
+    # (B, 3, 3)
+    return torch.stack([
+        torch.stack([c, -s, zero], dim=-1),
+        torch.stack([s,  c, zero], dim=-1),
+        torch.stack([zero, zero, one], dim=-1),
+    ], dim=-2)
+
+
+def _rotation_matrix_x(angle):
+    """Fixed rotation matrix around X axis. angle: scalar (float)"""
+    c = math.cos(angle)
+    s = math.sin(angle)
+    return [[1, 0, 0], [0, c, -s], [0, s, c]]
+
+
+def _rotation_matrix_z_fixed(angle):
+    """Fixed rotation matrix around Z axis. angle: scalar (float)"""
+    c = math.cos(angle)
+    s = math.sin(angle)
+    return [[c, -s, 0], [s, c, 0], [0, 0, 1]]
+
+
+def _make_transform(xyz, rpy):
+    """
+    Create a 4x4 homogeneous transform from xyz translation and rpy rotation.
+    Returns a list-of-lists (will be converted to tensor later).
+    rpy = (roll, pitch, yaw) = rotations around (x, y, z) in that order.
+    """
+    # R = Rz(yaw) @ Ry(pitch) @ Rx(roll)
+    # For Panda URDF, only roll (rx) rotations appear (pitch=yaw=0 mostly)
+    rx, ry, rz = rpy
+    # Build rotation: Rz @ Ry @ Rx
+    cx, sx = math.cos(rx), math.sin(rx)
+    cy, sy = math.cos(ry), math.sin(ry)
+    cz, sz = math.cos(rz), math.sin(rz)
+
+    R = [
+        [cz*cy, cz*sy*sx - sz*cx, cz*sy*cx + sz*sx],
+        [sz*cy, sz*sy*sx + cz*cx, sz*sy*cx - cz*sx],
+        [-sy,   cy*sx,            cy*cx            ],
+    ]
+    T = [
+        [R[0][0], R[0][1], R[0][2], xyz[0]],
+        [R[1][0], R[1][1], R[1][2], xyz[1]],
+        [R[2][0], R[2][1], R[2][2], xyz[2]],
+        [0,       0,       0,       1      ],
+    ]
+    return T
+
+
+# Panda URDF joint parameters: (origin_xyz, origin_rpy, axis)
+# Joint axis is always z for Panda revolute joints
+_PANDA_JOINTS = [
+    # J1: panda_joint1
+    {'xyz': (0, 0, 0.333), 'rpy': (0, 0, 0)},
+    # J2: panda_joint2
+    {'xyz': (0, 0, 0), 'rpy': (-math.pi/2, 0, 0)},
+    # J3: panda_joint3
+    {'xyz': (0, -0.316, 0), 'rpy': (math.pi/2, 0, 0)},
+    # J4: panda_joint4
+    {'xyz': (0.0825, 0, 0), 'rpy': (math.pi/2, 0, 0)},
+    # J5: panda_joint5
+    {'xyz': (-0.0825, 0.384, 0), 'rpy': (-math.pi/2, 0, 0)},
+    # J6: panda_joint6
+    {'xyz': (0, 0, 0), 'rpy': (math.pi/2, 0, 0)},
+    # J7: panda_joint7
+    {'xyz': (0.088, 0, 0), 'rpy': (math.pi/2, 0, 0)},
+]
+
+# Fixed transforms after joint7
+_PANDA_FIXED_J8 = {'xyz': (0, 0, 0.107), 'rpy': (0, 0, 0)}
+_PANDA_FIXED_HAND = {'xyz': (0, 0, 0), 'rpy': (0, 0, -math.pi/4)}
+
+# Panda joint limits (radians) from URDF
+_PANDA_JOINT_LIMITS = [
+    (-2.8973, 2.8973),   # J1
+    (-1.7628, 1.7628),   # J2
+    (-2.8973, 2.8973),   # J3
+    (-3.0718, -0.0698),  # J4
+    (-2.8973, 2.8973),   # J5
+    (-0.0175, 3.7525),   # J6
+    (-2.8973, 2.8973),   # J7
+]
+
+# Keypoint-to-joint mapping:
+# link0 = base (before any joint)
+# link2 = after J1, J2
+# link3 = after J1, J2, J3
+# link4 = after J1, J2, J3, J4
+# link6 = after J1, ..., J6
+# link7 = after J1, ..., J7
+# hand  = after J1, ..., J7, J8_fixed, hand_fixed
+_KEYPOINT_JOINT_INDICES = [0, 2, 3, 4, 6, 7, 8]  # 8 = hand (after all joints + fixed)
+
+
+def panda_forward_kinematics(joint_angles):
+    """
+    Compute forward kinematics for Panda robot.
+
+    Args:
+        joint_angles: (B, 7) joint angles in radians
+
+    Returns:
+        keypoint_positions: (B, 7, 3) keypoint positions in robot base frame (meters)
+    """
+    B = joint_angles.shape[0]
+    device = joint_angles.device
+    dtype = joint_angles.dtype
+
+    # Precompute fixed origin transforms as tensors
+    fixed_transforms = []
+    for j_info in _PANDA_JOINTS:
+        T = _make_transform(j_info['xyz'], j_info['rpy'])
+        fixed_transforms.append(torch.tensor(T, device=device, dtype=dtype))
+
+    T_j8 = torch.tensor(_make_transform(_PANDA_FIXED_J8['xyz'], _PANDA_FIXED_J8['rpy']),
+                         device=device, dtype=dtype)
+    T_hand = torch.tensor(_make_transform(_PANDA_FIXED_HAND['xyz'], _PANDA_FIXED_HAND['rpy']),
+                          device=device, dtype=dtype)
+
+    # Identity for base
+    eye4 = torch.eye(4, device=device, dtype=dtype).unsqueeze(0).expand(B, -1, -1)
+
+    # Accumulate transforms: T_cumul[i] = T_0 @ ... @ T_i
+    # where T_i = fixed_origin_i @ Rz(theta_i)
+    cumul = eye4.clone()  # (B, 4, 4) - base frame
+
+    # Store cumulative transforms after each joint
+    # Index 0..6 = after J1..J7, index 7 = after J8_fixed, index 8 = after hand_fixed
+    all_transforms = [cumul.clone()]  # [0] = base (before J1)
+
+    for i in range(7):
+        # Fixed origin transform (broadcast to batch)
+        T_fixed = fixed_transforms[i].unsqueeze(0).expand(B, -1, -1)  # (B, 4, 4)
+
+        # Joint rotation around z
+        theta = joint_angles[:, i]  # (B,)
+        R_joint = torch.eye(4, device=device, dtype=dtype).unsqueeze(0).expand(B, -1, -1).clone()
+        R_joint[:, :3, :3] = _rotation_matrix_z(theta)
+
+        # Cumulative: cumul = cumul @ T_fixed @ R_joint
+        cumul = cumul @ T_fixed @ R_joint
+
+        all_transforms.append(cumul.clone())  # [i+1] = after J(i+1)
+
+    # After J7, apply fixed J8 and hand transforms
+    T_j8_batch = T_j8.unsqueeze(0).expand(B, -1, -1)
+    T_hand_batch = T_hand.unsqueeze(0).expand(B, -1, -1)
+
+    cumul_j8 = cumul @ T_j8_batch
+    all_transforms.append(cumul_j8.clone())  # [8] = after J8 fixed
+
+    cumul_hand = cumul_j8 @ T_hand_batch
+    all_transforms.append(cumul_hand.clone())  # [9] = after hand fixed
+
+    # Extract keypoint positions
+    # link0=base=[0], link2=after J2=[2], link3=after J3=[3],
+    # link4=after J4=[4], link6=after J6=[6], link7=after J7=[7], hand=[9]
+    kp_indices = [0, 2, 3, 4, 6, 7, 9]
+    keypoints = []
+    for idx in kp_indices:
+        pos = all_transforms[idx][:, :3, 3]  # (B, 3)
+        keypoints.append(pos)
+
+    return torch.stack(keypoints, dim=1)  # (B, 7, 3)
+
+
+class JointAngleHead(nn.Module):
+    """
+    Predicts 7 joint angles for Panda robot from visual features + heatmaps.
+    Uses FK to produce 3D keypoints in robot base frame.
+    """
+
+    def __init__(self, input_dim=FEATURE_DIM, num_joints=NUM_JOINTS, num_angles=7):
+        super().__init__()
+        self.num_joints = num_joints
+        self.num_angles = num_angles
+        self.hidden_dim = 256
+
+        # Joint limits as buffers
+        limits = torch.tensor(_PANDA_JOINT_LIMITS, dtype=torch.float32)  # (7, 2)
+        self.register_buffer('joint_lower', limits[:, 0])  # (7,)
+        self.register_buffer('joint_upper', limits[:, 1])  # (7,)
+        self.register_buffer('joint_mid', (limits[:, 0] + limits[:, 1]) / 2)  # (7,)
+        self.register_buffer('joint_range', (limits[:, 1] - limits[:, 0]) / 2)  # (7,)
+
+        # 1. Per-joint feature refinement
+        # Input: visual feature (input_dim) + normalized 2D coords (2)
+        self.joint_feature_net = nn.Sequential(
+            nn.Linear(input_dim + 2, self.hidden_dim),
+            nn.GELU(),
+            nn.LayerNorm(self.hidden_dim)
+        )
+
+        # 2. Self-attention for kinematic constraint learning
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=self.hidden_dim,
+            nhead=8,
+            dim_feedforward=512,
+            dropout=0.1,
+            activation='gelu',
+            batch_first=True
+        )
+        self.joint_relation_net = nn.TransformerEncoder(encoder_layer, num_layers=4)
+
+        # 3. Predict joint angles (7 angles from 7 keypoint features)
+        self.angle_predictor = nn.Sequential(
+            nn.Linear(self.hidden_dim * num_joints, 256),
+            nn.GELU(),
+            nn.LayerNorm(256),
+            nn.Linear(256, num_angles)
+        )
+
+    def forward(self, dino_features, predicted_heatmaps):
+        """
+        Args:
+            dino_features: (B, N, D) backbone patch tokens
+            predicted_heatmaps: (B, NUM_JOINTS, H, W) 2D belief maps
+        Returns:
+            joint_angles: (B, 7) predicted joint angles (radians, within limits)
+            keypoints_3d_robot: (B, 7, 3) FK-computed 3D keypoints in robot base frame
+        """
+        b, n, d = dino_features.shape
+        h = w = int(math.sqrt(n))
+
+        feat_map = dino_features.permute(0, 2, 1).reshape(b, d, h, w)
+
+        # Extract 2D keypoint locations from heatmaps
+        uv_heatmap = soft_argmax_2d(predicted_heatmaps)  # (B, NJ, 2)
+
+        # Normalize 2D coords to [-1, 1]
+        hm_h, hm_w = predicted_heatmaps.shape[2], predicted_heatmaps.shape[3]
+        uv_normalized = uv_heatmap.clone()
+        uv_normalized[:, :, 0] = (uv_normalized[:, :, 0] / hm_w) * 2.0 - 1.0
+        uv_normalized[:, :, 1] = (uv_normalized[:, :, 1] / hm_h) * 2.0 - 1.0
+
+        # Spatial Softmax Pooling for visual features
+        weights = F.interpolate(predicted_heatmaps, size=(h, w), mode='bilinear', align_corners=False)
+        weights = torch.clamp(weights, min=0)
+        weights_flat = weights.reshape(b, self.num_joints, -1)
+        weights_norm = F.softmax(weights_flat / 0.1, dim=-1)
+        weights_norm = weights_norm.reshape(b, self.num_joints, h, w)
+
+        joint_features = torch.einsum('bdhw,bjhw->bjd', feat_map, weights_norm)  # (B, NJ, D)
+
+        # Concatenate 2D coordinates
+        joint_features = torch.cat([joint_features, uv_normalized], dim=-1)  # (B, NJ, D+2)
+
+        # Feature refinement + self-attention
+        refined = self.joint_feature_net(joint_features)  # (B, NJ, 256)
+        related = self.joint_relation_net(refined)  # (B, NJ, 256)
+
+        # Flatten and predict angles
+        flat_features = related.reshape(b, -1)  # (B, NJ * 256)
+        raw_angles = self.angle_predictor(flat_features)  # (B, 7)
+
+        # Apply joint limits via tanh scaling: mid + tanh(raw) * range
+        joint_angles = self.joint_mid.unsqueeze(0) + torch.tanh(raw_angles) * self.joint_range.unsqueeze(0)
+
+        # Forward kinematics
+        keypoints_3d_robot = panda_forward_kinematics(joint_angles)  # (B, 7, 3)
+
+        return joint_angles, keypoints_3d_robot
+
+
 class DINOv3PoseEstimator(nn.Module):
     def __init__(self, dino_model_name, heatmap_size, unfreeze_blocks=2,
                  use_joint_embedding=False, mode_3d=MODE_DIRECT):
@@ -331,13 +607,22 @@ class DINOv3PoseEstimator(nn.Module):
             heatmap_size=heatmap_size
         )
 
-        # 2. 3D Keypoint Predictor
-        self.keypoint_3d_head = Keypoint3DHead(
-            input_dim=feature_dim,
-            num_joints=NUM_JOINTS,
-            use_joint_embedding=use_joint_embedding,
-            mode=mode_3d
-        )
+        # 2. 3D Keypoint Predictor (or Joint Angle Head)
+        if mode_3d == MODE_JOINT_ANGLE:
+            self.joint_angle_head = JointAngleHead(
+                input_dim=feature_dim,
+                num_joints=NUM_JOINTS,
+                num_angles=7
+            )
+            self.keypoint_3d_head = None
+        else:
+            self.keypoint_3d_head = Keypoint3DHead(
+                input_dim=feature_dim,
+                num_joints=NUM_JOINTS,
+                use_joint_embedding=use_joint_embedding,
+                mode=mode_3d
+            )
+            self.joint_angle_head = None
 
     def forward(self, image_tensor_batch, camera_K=None, original_size=None):
         """
@@ -353,14 +638,24 @@ class DINOv3PoseEstimator(nn.Module):
         predicted_heatmaps = self.keypoint_head(dino_features)
 
         # 3. Lift 2D representations to 3D spatial coordinates
-        predicted_kpts_3d = self.keypoint_3d_head(
-            dino_features, predicted_heatmaps,
-            camera_K=camera_K,
-            heatmap_size=self.heatmap_size,
-            original_size=original_size
-        )
-
-        return {
-            'heatmaps_2d': predicted_heatmaps,
-            'keypoints_3d': predicted_kpts_3d
-        }
+        if self.mode_3d == MODE_JOINT_ANGLE:
+            joint_angles, kpts_3d_robot = self.joint_angle_head(
+                dino_features, predicted_heatmaps
+            )
+            return {
+                'heatmaps_2d': predicted_heatmaps,
+                'keypoints_3d': kpts_3d_robot,  # robot base frame
+                'joint_angles': joint_angles,
+                'keypoints_3d_robot': kpts_3d_robot,
+            }
+        else:
+            predicted_kpts_3d = self.keypoint_3d_head(
+                dino_features, predicted_heatmaps,
+                camera_K=camera_K,
+                heatmap_size=self.heatmap_size,
+                original_size=original_size
+            )
+            return {
+                'heatmaps_2d': predicted_heatmaps,
+                'keypoints_3d': predicted_kpts_3d
+            }

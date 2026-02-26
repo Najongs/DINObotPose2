@@ -24,7 +24,8 @@ from tqdm import tqdm
 import yaml
 import wandb
 
-from model import DINOv3PoseEstimator, MODE_DIRECT, MODE_DEPTH_ONLY
+from model import (DINOv3PoseEstimator, MODE_DIRECT, MODE_DEPTH_ONLY,
+                    MODE_JOINT_ANGLE, panda_forward_kinematics)
 from dataset import PoseEstimationDataset, create_dataloaders
 
 import sys
@@ -59,11 +60,15 @@ class UnifiedPoseLoss(nn.Module):
         heatmap_weight: float = 1.0,
         kp3d_weight: float = 10.0,  # 3D 좌표는 값의 범위가 작으므로 가중치를 높게 설정
         heatmap_size: int = 512,
+        angle_weight: float = 0.0,  # Joint angle MSE loss weight
+        fk_3d_weight: float = 0.0,  # FK 3D keypoint MSE loss weight (robot frame)
     ):
         super().__init__()
         self.heatmap_weight = heatmap_weight
         self.kp3d_weight = kp3d_weight
         self.heatmap_size = heatmap_size
+        self.angle_weight = angle_weight
+        self.fk_3d_weight = fk_3d_weight
 
         self.heatmap_loss = nn.MSELoss()
         self.eps = 1e-6  # Numerical stability
@@ -118,6 +123,26 @@ class UnifiedPoseLoss(nn.Module):
             'heatmap': loss_heatmap.item(),
             'kp3d': loss_kp3d.item(),
         }
+
+        # Joint angle loss (joint_angle mode only)
+        if self.angle_weight > 0 and 'joint_angles' in pred_dict and 'angles' in gt_dict:
+            pred_angles = pred_dict['joint_angles']  # (B, 7)
+            gt_angles = gt_dict['angles']  # (B, 7)
+            loss_angle = torch.nn.functional.mse_loss(pred_angles, gt_angles)
+            total_loss = total_loss + self.angle_weight * loss_angle
+            loss_dict['angle'] = loss_angle.item()
+
+        # FK 3D loss: compare FK(pred_angles) vs FK(gt_angles) in robot frame
+        if self.fk_3d_weight > 0 and 'joint_angles' in pred_dict and 'angles' in gt_dict:
+            pred_kp_robot = pred_dict['keypoints_3d_robot']  # (B, 7, 3) already FK'd
+            gt_angles = gt_dict['angles']  # (B, 7)
+            gt_kp_robot = panda_forward_kinematics(gt_angles)  # (B, 7, 3)
+            loss_fk_3d = torch.nn.functional.mse_loss(pred_kp_robot, gt_kp_robot)
+            total_loss = total_loss + self.fk_3d_weight * loss_fk_3d
+            loss_dict['fk_3d'] = loss_fk_3d.item()
+
+        # Update total in loss_dict
+        loss_dict['total'] = total_loss.item()
 
         return total_loss, loss_dict
 
@@ -309,6 +334,9 @@ class Trainer:
             camera_K = batch['camera_K'].to(self.device) if 'camera_K' in batch else None
             original_size = batch['original_size'][0].tolist() if 'original_size' in batch else None
 
+            # Joint angles for joint_angle mode
+            gt_angles = batch['angles'].to(self.device) if 'angles' in batch else None
+
             # Forward pass
             pred_dict = self.model(images, camera_K=camera_K, original_size=original_size)
 
@@ -318,6 +346,8 @@ class Trainer:
                 'keypoints_3d': gt_keypoints_3d,
                 'valid_mask': gt_valid_mask
             }
+            if gt_angles is not None:
+                gt_dict['angles'] = gt_angles
 
             # Compute loss
             loss, loss_dict = self.criterion(pred_dict, gt_dict)
@@ -330,6 +360,8 @@ class Trainer:
 
             # Record losses
             for key, value in loss_dict.items():
+                if key not in epoch_losses:
+                    epoch_losses[key] = []
                 epoch_losses[key].append(value)
 
             # Update progress bar (only on main process)
@@ -339,6 +371,10 @@ class Trainer:
                     'hm': f"{loss_dict['heatmap']:.6f}",
                     'kp3d': f"{loss_dict['kp3d']:.6f}"
                 }
+                if 'angle' in loss_dict:
+                    postfix['ang'] = f"{loss_dict['angle']:.6f}"
+                if 'fk_3d' in loss_dict:
+                    postfix['fk'] = f"{loss_dict['fk_3d']:.6f}"
                 pbar.set_postfix(postfix)
 
                 # Log batch losses to wandb every N batches
@@ -399,6 +435,9 @@ class Trainer:
             camera_K = batch['camera_K'].to(self.device) if 'camera_K' in batch else None
             original_size = batch['original_size'][0].tolist() if 'original_size' in batch else None
 
+            # Joint angles for joint_angle mode
+            gt_angles = batch['angles'].to(self.device) if 'angles' in batch else None
+
             # Forward pass
             pred_dict = self.model(images, camera_K=camera_K, original_size=original_size)
 
@@ -408,12 +447,16 @@ class Trainer:
                 'keypoints_3d': gt_keypoints_3d,
                 'valid_mask': gt_valid_mask
             }
+            if gt_angles is not None:
+                gt_dict['angles'] = gt_angles
 
             # Compute loss
             _, loss_dict = self.criterion(pred_dict, gt_dict)
 
             # Record losses
             for key, value in loss_dict.items():
+                if key not in epoch_losses:
+                    epoch_losses[key] = []
                 epoch_losses[key].append(value)
 
             # Collect data for metrics
@@ -450,6 +493,10 @@ class Trainer:
                     'hm': f"{loss_dict['heatmap']:.6f}",
                     'kp3d': f"{loss_dict['kp3d']:.6f}"
                 }
+                if 'angle' in loss_dict:
+                    postfix['ang'] = f"{loss_dict['angle']:.6f}"
+                if 'fk_3d' in loss_dict:
+                    postfix['fk'] = f"{loss_dict['fk_3d']:.6f}"
                 pbar.set_postfix(postfix)
 
         # Average losses
@@ -585,8 +632,18 @@ class Trainer:
                 epoch_time = time.time() - epoch_start
                 print(f"\nEpoch {epoch} Summary:")
 
-                print(f"  Train Loss: {train_losses['total']:.6f} (hm: {train_losses['heatmap']:.6f}, kp3d: {train_losses['kp3d']:.6f})")
-                print(f"  Val Loss:   {val_losses['total']:.6f} (hm: {val_losses['heatmap']:.6f}, kp3d: {val_losses['kp3d']:.6f})")
+                train_extra = ""
+                val_extra = ""
+                if 'angle' in train_losses:
+                    train_extra += f", ang: {train_losses['angle']:.6f}"
+                if 'fk_3d' in train_losses:
+                    train_extra += f", fk: {train_losses['fk_3d']:.6f}"
+                if 'angle' in val_losses:
+                    val_extra += f", ang: {val_losses['angle']:.6f}"
+                if 'fk_3d' in val_losses:
+                    val_extra += f", fk: {val_losses['fk_3d']:.6f}"
+                print(f"  Train Loss: {train_losses['total']:.6f} (hm: {train_losses['heatmap']:.6f}, kp3d: {train_losses['kp3d']:.6f}{train_extra})")
+                print(f"  Val Loss:   {val_losses['total']:.6f} (hm: {val_losses['heatmap']:.6f}, kp3d: {val_losses['kp3d']:.6f}{val_extra})")
                 if 'val_pck_auc' in val_losses:
                     print(f"  Val PCK AUC: {val_losses['val_pck_auc']:.4f}, ADD AUC: {val_losses['val_add_auc']:.4f}")
                     print(f"  Val ADD Mean: {val_losses['val_add_mean_mm']:.2f}mm, PnP Succ: {val_losses['val_pnp_success_rate']:.2%}")
@@ -845,7 +902,12 @@ def main(args):
             if is_main_process:
                 print(f"Warning: Failed to load camera settings: {e}")
 
-    mode_3d = MODE_DEPTH_ONLY if args.depth_only_3d else MODE_DIRECT
+    if args.joint_angle_3d:
+        mode_3d = MODE_JOINT_ANGLE
+    elif args.depth_only_3d:
+        mode_3d = MODE_DEPTH_ONLY
+    else:
+        mode_3d = MODE_DIRECT
     if is_main_process:
         print(f"3D prediction mode: {mode_3d}")
 
@@ -878,10 +940,14 @@ def main(args):
         print(f"Trainable parameters: {sum(p.numel() for p in model_to_count.parameters() if p.requires_grad):,}")
 
     # Loss function
+    angle_w = args.angle_weight if args.joint_angle_3d else 0.0
+    fk_3d_w = args.fk_3d_weight if args.joint_angle_3d else 0.0
     criterion = UnifiedPoseLoss(
         heatmap_weight=args.heatmap_weight,
-        kp3d_weight=args.kp3d_weight,
+        kp3d_weight=args.kp3d_weight if not args.joint_angle_3d else 0.0,  # disable camera-frame 3D loss in joint_angle mode
         heatmap_size=args.heatmap_size,
+        angle_weight=angle_w,
+        fk_3d_weight=fk_3d_w,
     )
 
     # Optimizer
@@ -939,6 +1005,9 @@ def main(args):
         'unfreeze_blocks': args.unfreeze_blocks,
         'use_joint_embedding': args.use_joint_embedding,
         'depth_only_3d': args.depth_only_3d,
+        'joint_angle_3d': args.joint_angle_3d,
+        'angle_weight': angle_w,
+        'fk_3d_weight': fk_3d_w,
         'batch_size': args.batch_size,
         'epochs': args.epochs,
         'optimizer': args.optimizer,
@@ -1015,6 +1084,8 @@ if __name__ == '__main__':
                         help='Enable joint identity embeddings in 3D head for kinematic constraint learning')
     parser.add_argument('--depth-only-3d', action='store_true', default=False,
                         help='Predict only depth (z), recover x,y from 2D heatmap + camera K')
+    parser.add_argument('--joint-angle-3d', action='store_true', default=False,
+                        help='Predict joint angles → FK → robot-frame 3D keypoints')
 
     # Training
     parser.add_argument('--epochs', type=int, default=100,
@@ -1049,6 +1120,10 @@ if __name__ == '__main__':
                         help='Weight for heatmap loss')
     parser.add_argument('--kp3d-weight', type=float, default=10.0,
                         help='Weight for 3D keypoint loss')
+    parser.add_argument('--angle-weight', type=float, default=1.0,
+                        help='Weight for joint angle MSE loss (joint_angle mode)')
+    parser.add_argument('--fk-3d-weight', type=float, default=10.0,
+                        help='Weight for FK 3D keypoint MSE loss (joint_angle mode)')
     # Output
     parser.add_argument('--output-dir', type=str, default='./outputs',
                         help='Output directory for checkpoints and logs')

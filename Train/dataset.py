@@ -366,13 +366,11 @@ class PoseEstimationDataset(Dataset):
             # Default fallback (should not happen with proper data)
             keypoints['camera_K'] = np.eye(3, dtype=np.float32)
 
-        # Joint angles (있는 경우)
-        if self.include_angles and 'joint_angles' in data:
-            # Normalize angles to [-1, 1] range (assuming radians)
-            # Most robot joints are within [-pi, pi]
-            angles = np.array(data['joint_angles'], dtype=np.float32)
-            angles = angles / np.pi  # Scale to [-1, 1] approx
-            keypoints['angles'] = angles
+        # Joint angles from sim_state.joints (first 7 joint positions)
+        if self.include_angles and 'sim_state' in data and 'joints' in data['sim_state']:
+            joints = data['sim_state']['joints']
+            angles = np.array([j['position'] for j in joints[:7]], dtype=np.float32)
+            keypoints['angles'] = angles  # radians, no normalization (FK needs raw radians)
 
         return keypoints
 
@@ -485,7 +483,7 @@ class PoseEstimationDataset(Dataset):
             sample['angles'] = torch.from_numpy(angles).float()
         else:
             # Dummy angles (모델이 angle 출력을 요구하는 경우)
-            sample['angles'] = torch.zeros(9).float()  # NUM_ANGLES = 9
+            sample['angles'] = torch.zeros(7).float()  # 7 joint angles for Panda
 
         return sample
 

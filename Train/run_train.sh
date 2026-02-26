@@ -18,7 +18,12 @@ HEATMAP_SIZE=512
 UNFREEZE_BLOCKS=2  # Number of backbone blocks to unfreeze for fine-tuning
 
 USE_JOINT_EMBEDDING=True  # Enable joint identity embeddings in 3D head
-DEPTH_ONLY_3D=True  # Predict only depth (z), recover x,y from 2D heatmap + camera K
+DEPTH_ONLY_3D=False  # Predict only depth (z), recover x,y from 2D heatmap + camera K
+JOINT_ANGLE_3D=True  # Predict joint angles → FK → robot-frame 3D keypoints
+
+# Joint angle mode loss weights
+ANGLE_WEIGHT=1.0     # Joint angle MSE loss weight
+FK_3D_WEIGHT=10.0    # FK 3D keypoint MSE loss weight (robot frame)
 
 # FDA (Fourier Domain Adaptation) for sim-to-real
 FDA_REAL_DIR="/data/public/NAS/DINObotPose2/Dataset/DREAM_real"  # Real images (no labels needed)
@@ -46,7 +51,7 @@ WANDB_RUN_NAME="dinov3_base_$(date +%Y%m%d_%H%M%S)"
 
 # Other settings
 SEED=42
-RESUME="/data/public/NAS/DINObotPose2/Train/outputs/dinov3_base_20260226_112034/best_model.pth"  # Path to checkpoint for resuming (leave empty for new training)
+RESUME=""  # Path to checkpoint for resuming (leave empty for new training)
 
 # =============================================================================
 # Training Modes
@@ -80,6 +85,13 @@ else
     DEPTH_ONLY_FLAG=""
 fi
 
+# Build joint angle 3D flag
+if [ "${JOINT_ANGLE_3D}" = "True" ] || [ "${JOINT_ANGLE_3D}" = "true" ]; then
+    JOINT_ANGLE_FLAG="--joint-angle-3d --angle-weight ${ANGLE_WEIGHT} --fk-3d-weight ${FK_3D_WEIGHT}"
+else
+    JOINT_ANGLE_FLAG=""
+fi
+
 # Build base command
 BASE_CMD="python train.py \
     --data-dir ${DATA_DIR} \
@@ -90,6 +102,7 @@ BASE_CMD="python train.py \
     --unfreeze-blocks ${UNFREEZE_BLOCKS} \
     ${JOINT_EMBEDDING_FLAG} \
     ${DEPTH_ONLY_FLAG} \
+    ${JOINT_ANGLE_FLAG} \
     --epochs ${EPOCHS} \
     --batch-size ${BATCH_SIZE} \
     --num-workers ${NUM_WORKERS} \
@@ -151,6 +164,7 @@ elif [ "${TRAIN_MODE}" = "multi_gpu" ]; then
         --unfreeze-blocks ${UNFREEZE_BLOCKS} \
         ${JOINT_EMBEDDING_FLAG} \
         ${DEPTH_ONLY_FLAG} \
+        ${JOINT_ANGLE_FLAG} \
         --epochs ${EPOCHS} \
         --batch-size ${BATCH_SIZE} \
         --num-workers ${NUM_WORKERS} \

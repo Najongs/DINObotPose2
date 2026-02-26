@@ -1100,21 +1100,66 @@ def main(args):
 
     if args.val_dir:
         # Separate train/val directories
-        train_loader, val_loader = create_dataloaders(
-            train_dir=args.data_dir,
-            val_dir=args.val_dir,
+        # Build datasets directly to support DistributedSampler
+        from dataset import PoseEstimationDataset
+        import torch.utils.data as tud
+
+        train_dataset = PoseEstimationDataset(
+            data_dir=args.data_dir,
             keypoint_names=keypoint_names,
-            batch_size=args.batch_size,
-            num_workers=args.num_workers,
             image_size=(args.image_size, args.image_size),
             heatmap_size=(args.heatmap_size, args.heatmap_size),
-            val_split=args.val_split,
-            # worker_init_fn=worker_init_fn,
+            augment=True,
             multi_robot=args.multi_robot,
             robot_types=args.robot_types,
             fda_real_dir=args.fda_real_dir,
             fda_beta=args.fda_beta,
             fda_prob=args.fda_prob
+        )
+
+        val_dataset_full = PoseEstimationDataset(
+            data_dir=args.val_dir,
+            keypoint_names=keypoint_names,
+            image_size=(args.image_size, args.image_size),
+            heatmap_size=(args.heatmap_size, args.heatmap_size),
+            augment=False,
+            multi_robot=args.multi_robot,
+            robot_types=args.robot_types,
+            fda_real_dir=None,
+            fda_beta=args.fda_beta,
+            fda_prob=0.0
+        )
+
+        if args.val_split < 1.0:
+            val_size = int(len(val_dataset_full) * args.val_split)
+            unused_size = len(val_dataset_full) - val_size
+            generator = torch.Generator().manual_seed(args.seed if args.seed is not None else 42)
+            val_dataset, _ = tud.random_split(val_dataset_full, [val_size, unused_size], generator=generator)
+        else:
+            val_dataset = val_dataset_full
+
+        if is_distributed:
+            train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True)
+            val_sampler = DistributedSampler(val_dataset, num_replicas=world_size, rank=rank, shuffle=False)
+        else:
+            train_sampler = None
+            val_sampler = None
+
+        train_loader = tud.DataLoader(
+            train_dataset,
+            batch_size=args.batch_size,
+            shuffle=(train_sampler is None),
+            sampler=train_sampler,
+            num_workers=args.num_workers,
+            pin_memory=True
+        )
+        val_loader = tud.DataLoader(
+            val_dataset,
+            batch_size=args.batch_size,
+            shuffle=False,
+            sampler=val_sampler,
+            num_workers=args.num_workers,
+            pin_memory=True
         )
     else:
         # Create separate train and val datasets with different augmentation settings

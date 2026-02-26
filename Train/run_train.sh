@@ -8,17 +8,14 @@
 # =============================================================================
 
 # Data paths (REQUIRED - Update these paths!)
-<<<<<<< HEAD
 DATA_DIR="/data/public/NAS/DINObotPose2/Dataset/Converted_dataset/DREAM_to_DREAM_syn/panda_synth_train_dr"  # Training data directory
+VAL_DIR="/data/public/NAS/DINObotPose2/Dataset/Converted_dataset/DREAM_to_DREAM_syn/panda_synth_test_dr"  
+
 # DATA_DIR="/home/najo/NAS/DIP/2025_ICRA_Multi_View_Robot_Pose_Estimation/dataset/Converted_dataset/DREAM_to_DREAM_syn/panda_synth_train_dr"  # Training data directory
-TRAIN_SPLIT=0.9  # Train/Val split ratio (0.9 = 90% train, 10% val)
-=======
-# DATA_DIR="/data/public/NAS/DINObotPose2/Dataset/Converted_dataset/DREAM_to_DREAM_syn/panda_synth_train_dr"  # Training data directory
-DATA_DIR="/home/najo/NAS/DIP/2025_ICRA_Multi_View_Robot_Pose_Estimation/dataset/Converted_dataset/DREAM_to_DREAM_syn/panda_synth_train_dr"  # Training data directory
-VAL_DIR="/home/najo/NAS/DIP/2025_ICRA_Multi_View_Robot_Pose_Estimation/dataset/DREAM_syn/panda_synth_test_dr"  # Validation data directory (separate from training)
+# VAL_DIR="/home/najo/NAS/DIP/2025_ICRA_Multi_View_Robot_Pose_Estimation/dataset/DREAM_syn/panda_synth_test_dr"  # Validation data directory (separate from training)
+
 TRAIN_SPLIT=1.0  # Train split ratio (1.0 = use all training data when VAL_DIR is specified)
 VAL_SPLIT=0.1  # Validation data usage ratio (0.1 = use 10% of validation data)
->>>>>>> refs/remotes/origin/main
 
 # Model configuration
 MODEL_NAME='facebook/dinov3-vitb16-pretrain-lvd1689m'
@@ -65,11 +62,7 @@ WANDB_RUN_NAME="dinov3_base_$(date +%Y%m%d_%H%M%S)"
 # Other settings
 SEED=42
 RESUME=""  # Path to checkpoint for resuming (leave empty for new training)
-<<<<<<< HEAD
-LOAD_2D_HEAD="/data/public/NAS/DINObotPose2/Train/outputs/dinov3_base_20260225_231442/best_model.pth"  # Path to checkpoint for loading pretrained 2D heatmap head (leave empty to train from scratch)
-=======
-LOAD_2D_HEAD="/home/najo/NAS/DIP/DINObotPose2/Train/outputs/dinov3_base_20260226_161726/best_model.pth"  # Path to checkpoint for loading pretrained 2D heatmap head (leave empty to train from scratch)
->>>>>>> refs/remotes/origin/main
+LOAD_2D_HEAD="/data/public/NAS/DINObotPose2/Train/outputs/dinov3_base_20260226_161653/best_model.pth"  # Path to checkpoint for loading pretrained 2D heatmap head (leave empty to train from scratch)
 
 # =============================================================================
 # Training Modes
@@ -82,8 +75,8 @@ LOAD_2D_HEAD="/home/najo/NAS/DIP/DINObotPose2/Train/outputs/dinov3_base_20260226
 
 # --- Multi-GPU Training (Distributed Data Parallel) ---
 TRAIN_MODE="multi_gpu"
-NUM_GPUS=5  # 사용할 GPU 개수 (single GPU는 1로 설정)
-GPU_IDS="0,1,2,3,4"  # 사용할 GPU ID (예: "0,1,2,3")
+NUM_GPUS=3  # 사용할 GPU 개수 (single GPU는 1로 설정)
+GPU_IDS="0,1,2"  # 사용할 GPU ID (예: "0,1,2,3")
 
 # =============================================================================
 # Execute Training

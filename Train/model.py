@@ -588,13 +588,16 @@ class JointAngleHead(nn.Module):
         )
         self.joint_relation_net = nn.TransformerEncoder(encoder_layer, num_layers=2)
 
-        # 3. Per-joint angle prediction (improved from global MLP)
-        # Each joint predicts its own angle based on contextual features
+        # 3. Global state → 7 angles at once
+        # After self-attention, mean-pool all joint tokens into a single robot state vector,
+        # then predict all 7 joint angles together.
+        # This is kinematically correct: joint angles are a global property of the robot
+        # configuration, not independently decodable from individual keypoint tokens.
         self.angle_predictor = nn.Sequential(
-            nn.Linear(self.hidden_dim, 128),
+            nn.Linear(self.hidden_dim, 256),
             nn.GELU(),
-            nn.LayerNorm(128),
-            nn.Linear(128, 1)  # Predict 1 angle per joint
+            nn.LayerNorm(256),
+            nn.Linear(256, self.num_angles)  # Predict all 7 angles at once
         )
 
     def forward(self, dino_features, predicted_heatmaps):
@@ -646,8 +649,11 @@ class JointAngleHead(nn.Module):
         refined = self.joint_feature_net(joint_features)  # (B, NJ, 256)
         related = self.joint_relation_net(refined)  # (B, NJ, 256)
 
-        # Per-joint angle prediction
-        raw_angles = self.angle_predictor(related).squeeze(-1)  # (B, NJ)
+        # Global pooling: aggregate all joint tokens into single robot state
+        global_state = related.mean(dim=1)  # (B, 256)
+
+        # Predict all 7 joint angles from global robot state
+        raw_angles = self.angle_predictor(global_state)  # (B, 7)
 
         # Apply joint limits via tanh scaling: mid + tanh(raw) * range
         joint_angles = self.joint_mid.unsqueeze(0) + torch.tanh(raw_angles) * self.joint_range.unsqueeze(0)

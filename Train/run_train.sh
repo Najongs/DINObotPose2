@@ -31,8 +31,12 @@ JOINT_ANGLE_3D=True  # Predict joint angles → FK → robot-frame 3D keypoints
 # angle loss: 라디안 단위 (범위 ~0~6), 3D loss: 미터 단위 (범위 ~0.01~0.5)
 # FK_3D는 robot frame 기준이므로 실제 성능 지표(camera frame ADD)와 좌표계가 다름
 # → angle loss로 자세 추정 → FK_3D로 구조적 일관성 강제 순서로 학습
-ANGLE_WEIGHT=1.0     # Joint angle MSE loss weight
-FK_3D_WEIGHT=10.0    # FK 3D keypoint MSE loss weight (robot frame)
+ANGLE_WEIGHT=10.0    # Joint angle MSE loss weight
+FK_3D_WEIGHT=100.0   # FK 3D keypoint MSE loss weight (robot frame)
+
+# Loss weights
+HEATMAP_WEIGHT=1.0
+KP3D_WEIGHT=100.0
 
 # FDA (Fourier Domain Adaptation) for sim-to-real
 FDA_REAL_DIR="/data/public/NAS/DINObotPose2/Dataset/DREAM_real"  # Real images (no labels needed)
@@ -53,10 +57,6 @@ SCHEDULER="cosine"  # Options: step, cosine, plateau, none
 # Loss configuration
 LOSS_TYPE="smoothl1"  # Loss function type: mse, l1, smoothl1 (smoothl1 recommended for ADD AUC)
 
-# Loss weights
-HEATMAP_WEIGHT=1.0
-KP3D_WEIGHT=100.0
-
 # Output and logging
 OUTPUT_DIR="./outputs/dinov3_base_$(date +%Y%m%d_%H%M%S)"
 WANDB_PROJECT="dinov3-pose-estimation"
@@ -64,8 +64,8 @@ WANDB_RUN_NAME="dinov3_base_$(date +%Y%m%d_%H%M%S)"
 
 # Other settings
 SEED=42
-RESUME=""  # Path to checkpoint for resuming (leave empty for new training)
-LOAD_2D_HEAD="/data/public/NAS/DINObotPose2/Train/outputs/dinov3_base_20260226_194659/best_model.pth"  # Path to checkpoint for loading pretrained 2D heatmap head (leave empty to train from scratch)
+RESUME="/data/public/NAS/DINObotPose2/Train/outputs/dinov3_base_20260227_002500/epoch_1.pth"  # Path to checkpoint for resuming (leave empty for new training)
+LOAD_2D_HEAD=""  # Path to checkpoint for loading pretrained 2D heatmap head (leave empty to train from scratch)
 
 # =============================================================================
 # Training Modes

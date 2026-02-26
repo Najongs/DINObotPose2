@@ -1,34 +1,34 @@
 {
     "dataset": "/data/public/NAS/DINObotPose2/Dataset/Converted_dataset/DREAM_to_DREAM/panda-3cam_azure",
-    "model": "/data/public/NAS/DINObotPose2/Train/outputs/dinov3_base_20260226_112034/best_model.pth",
+    "model": "/data/public/NAS/DINObotPose2/Train/outputs/dinov3_base_20260227_005854/epoch_3.pth",
     "num_frames": 6394,
     "keypoint_metrics": {
         "num_gt_inframe": 44121.0,
         "num_found_gt_inframe": 44121.0,
-        "l2_error_mean_px": 4.6365065574646,
-        "l2_error_median_px": 3.577446460723877,
-        "l2_error_std_px": 8.345296859741211,
-        "l2_error_auc": 0.7896571190589515,
+        "l2_error_mean_px": 4.37787389755249,
+        "l2_error_median_px": 3.206895589828491,
+        "l2_error_std_px": 8.590166091918945,
+        "l2_error_auc": 0.8031120838149635,
         "l2_error_auc_thresh_px": 20.0
     },
     "direct_add_metrics": {
         "num_frames": 6394.0,
-        "add_mean": 0.24857692420482635,
-        "add_median": 0.2459074854850769,
-        "add_std": 0.04455699771642685,
-        "add_auc": 0.0,
+        "add_mean": 0.2184309406822747,
+        "add_median": 0.1790743585760184,
+        "add_std": 0.14622656106422438,
+        "add_auc": 0.031317508601814203,
         "add_auc_thresh": 0.1,
-        "per_kp_mean": 0.24857693308857584,
-        "per_kp_median": 0.22650067508220673
+        "per_kp_mean": 0.21843094068227467,
+        "per_kp_median": 0.16944207305221592
     },
     "pnp_metrics": {
-        "num_pnp_found": 6394.0,
-        "num_pnp_not_found": 0.0,
+        "num_pnp_found": 0.0,
+        "num_pnp_not_found": 6394.0,
         "num_pnp_possible": 6394.0,
-        "add_mean": 0.04252707703942531,
-        "add_median": 0.017691573119095264,
-        "add_std": 0.08981899762365479,
-        "add_auc": 0.7383199014701283,
+        "add_mean": NaN,
+        "add_median": NaN,
+        "add_std": NaN,
+        "add_auc": 0.0,
         "add_auc_thresh": 0.1
     }
 }

@@ -278,22 +278,21 @@ class UnifiedPoseLoss(nn.Module):
                 try:
                     pred_kp_robot = pred_dict['keypoints_3d_robot']  # (B, 7, 3)
                     gt_kp_camera = gt_dict['keypoints_3d']  # (B, 7, 3) camera frame
-                    gt_kp_2d = gt_dict['keypoints']  # (B, 7, 2) pixel coordinates
+                    gt_kp_2d_heatmap = gt_dict['keypoints']  # (B, 7, 2) in heatmap coords
                     camera_K = gt_dict['camera_K']  # (B, 3, 3)
                     original_size = gt_dict['original_size']  # (B, 2) [W, H]
                     valid_mask = gt_dict.get('valid_mask', None)  # (B, 7)
 
-                    # Extract 2D keypoints from predicted heatmaps using soft-argmax
+                    # gt_kp_2d is in heatmap coords → scale to original image coords for PnP
+                    # camera_K is defined on original image (e.g. 640x480)
                     pred_heatmaps = pred_dict['heatmaps_2d']  # (B, 7, H, W)
-                    pred_kp_2d_heatmap = soft_argmax_2d(pred_heatmaps)  # (B, 7, 2) in heatmap coords
-
-                    # Scale to original image coordinates
                     H_hm, W_hm = pred_heatmaps.shape[2], pred_heatmaps.shape[3]
                     scale_x = original_size[:, 0:1] / W_hm  # (B, 1)
                     scale_y = original_size[:, 1:2] / H_hm  # (B, 1)
-                    pred_kp_2d = pred_kp_2d_heatmap.clone()
-                    pred_kp_2d[:, :, 0] = pred_kp_2d[:, :, 0] * scale_x
-                    pred_kp_2d[:, :, 1] = pred_kp_2d[:, :, 1] * scale_y
+                    # gt 2D: heatmap → original image coords
+                    gt_kp_2d_x = gt_kp_2d_heatmap[:, :, 0] * scale_x  # (B, 7)
+                    gt_kp_2d_y = gt_kp_2d_heatmap[:, :, 1] * scale_y  # (B, 7)
+                    gt_kp_2d = torch.stack([gt_kp_2d_x, gt_kp_2d_y], dim=-1)  # (B, 7, 2)
 
                     # Transform robot-frame to camera-frame using GT-based PnP (for stability)
                     B = pred_kp_robot.shape[0]
@@ -305,7 +304,7 @@ class UnifiedPoseLoss(nn.Module):
                         # Use GT robot-frame (from FK) for PnP to get stable transform
                         gt_angles_b = gt_dict['angles'][b]  # (7,)
                         gt_kp_robot_b = panda_forward_kinematics(gt_angles_b.unsqueeze(0))[0]  # (7, 3)
-                        gt_kp_2d_b = gt_kp_2d[b]  # (7, 2)
+                        gt_kp_2d_b = gt_kp_2d[b]  # (7, 2) in original image coords
                         camera_K_b = camera_K[b]  # (3, 3)
 
                         # Convert to numpy for PnP
@@ -368,7 +367,8 @@ class UnifiedPoseLoss(nn.Module):
 
                 except Exception as e:
                     # PnP can fail, gracefully skip camera-frame loss
-                    # print(f"Warning: Camera-frame 3D loss failed: {e}")
+                    import traceback
+                    print(f"[Warning] Camera-frame 3D loss failed: {e}\n{traceback.format_exc()}")
                     pass
 
         # Update total in loss_dict
@@ -563,7 +563,7 @@ class Trainer:
 
             # Camera K and original size for depth_only and joint_angle modes
             camera_K = batch['camera_K'].to(self.device) if 'camera_K' in batch else None
-            original_size = batch['original_size'] if 'original_size' in batch else None
+            original_size = batch['original_size'].to(self.device) if 'original_size' in batch else None
 
             # Joint angles for joint_angle mode
             gt_angles = batch['angles'].to(self.device) if 'angles' in batch else None
@@ -626,6 +626,14 @@ class Trainer:
                             'batch/train_heatmap_loss': loss_dict['heatmap'],
                             'batch/train_kp3d_loss': loss_dict['kp3d']
                         }
+                        if 'angle' in loss_dict:
+                            batch_log['batch/train_angle_loss'] = loss_dict['angle']
+                        if 'fk_3d' in loss_dict:
+                            batch_log['batch/train_fk3d_loss'] = loss_dict['fk_3d']
+                        if 'camera_3d' in loss_dict:
+                            batch_log['batch/train_camera3d_loss'] = loss_dict['camera_3d']
+                        if 'pnp_success_rate' in loss_dict:
+                            batch_log['batch/pnp_success_rate'] = loss_dict['pnp_success_rate']
                         wandb.log(batch_log, step=global_step)
                     except Exception:
                         pass  # Silently ignore batch logging errors
@@ -674,7 +682,7 @@ class Trainer:
 
             # Camera K and original size for depth_only and joint_angle modes
             camera_K = batch['camera_K'].to(self.device) if 'camera_K' in batch else None
-            original_size = batch['original_size'] if 'original_size' in batch else None
+            original_size = batch['original_size'].to(self.device) if 'original_size' in batch else None
 
             # Joint angles for joint_angle mode
             gt_angles = batch['angles'].to(self.device) if 'angles' in batch else None
@@ -869,6 +877,14 @@ class Trainer:
                         'learning_rate': current_lr,
                         'best_val_loss': self.best_val_loss
                     }
+                    if 'angle' in train_losses:
+                        log_dict['train/angle_loss'] = train_losses['angle']
+                    if 'fk_3d' in train_losses:
+                        log_dict['train/fk3d_loss'] = train_losses['fk_3d']
+                    if 'camera_3d' in train_losses:
+                        log_dict['train/camera3d_loss'] = train_losses['camera_3d']
+                    if 'pnp_success_rate' in train_losses:
+                        log_dict['train/pnp_success_rate'] = train_losses['pnp_success_rate']
                     # Add all validation metrics
                     for k, v in val_losses.items():
                         log_dict[f'val/{k}'] = v
@@ -898,9 +914,10 @@ class Trainer:
                     val_extra += f", cam3d: {val_losses['camera_3d']:.6f}"
                 print(f"  Train Loss: {train_losses['total']:.6f} (hm: {train_losses['heatmap']:.6f}, kp3d: {train_losses['kp3d']:.6f}{train_extra})")
                 print(f"  Val Loss:   {val_losses['total']:.6f} (hm: {val_losses['heatmap']:.6f}, kp3d: {val_losses['kp3d']:.6f}{val_extra})")
+                if 'val_add_auc' in val_losses:
+                    print(f"  Val ADD AUC: {val_losses['val_add_auc']:.4f}, ADD Mean: {val_losses['val_add_mean_mm']:.2f}mm, PnP Succ: {val_losses['val_pnp_success_rate']:.2%}")
                 if 'val_pck_auc' in val_losses:
-                    print(f"  Val PCK AUC: {val_losses['val_pck_auc']:.4f}, ADD AUC: {val_losses['val_add_auc']:.4f}")
-                    print(f"  Val ADD Mean: {val_losses['val_add_mean_mm']:.2f}mm, PnP Succ: {val_losses['val_pnp_success_rate']:.2%}")
+                    print(f"  Val PCK AUC: {val_losses['val_pck_auc']:.4f}, KP Mean Err: {val_losses['val_kp_mean_err_px']:.2f}px")
                 print(f"  Learning Rate: {current_lr:.8f}")
                 print(f"  Time: {epoch_time:.2f}s")
 

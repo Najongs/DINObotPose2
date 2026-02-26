@@ -4,10 +4,10 @@
 # Evaluates trained model on panda-3cam_azure dataset
 
 # Model configuration (update with your trained model path)
-MODEL_PATH="/home/najo/NAS/DIP/DINObotPose2/Train/outputs/dinov3_base_20260225_205248/best_model.pth"
+MODEL_PATH="/data/public/NAS/DINObotPose2/Train/outputs/dinov3_base_20260227_005854/epoch_3.pth"
 
 # Dataset (choose one of the following datasets)
-DATASET_DIR="/home/najo/NAS/DIP/2025_ICRA_Multi_View_Robot_Pose_Estimation/dataset/Converted_dataset/DREAM_to_DREAM/panda-3cam_azure"
+DATASET_DIR="/data/public/NAS/DINObotPose2/Dataset/Converted_dataset/DREAM_to_DREAM/panda-3cam_azure"
 # /home/najo/NAS/DIP/2025_ICRA_Multi_View_Robot_Pose_Estimation/dataset/Converted_dataset/DREAM_to_DREAM/panda-3cam_azure
 # /home/najo/NAS/DIP/2025_ICRA_Multi_View_Robot_Pose_Estimation/dataset/Converted_dataset/DREAM_to_DREAM/panda-3cam_kinect360
 # /home/najo/NAS/DIP/2025_ICRA_Multi_View_Robot_Pose_Estimation/dataset/Converted_dataset/DREAM_to_DREAM/panda-3cam_realsense

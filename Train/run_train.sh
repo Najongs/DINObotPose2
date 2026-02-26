@@ -10,7 +10,9 @@
 # Data paths (REQUIRED - Update these paths!)
 # DATA_DIR="/data/public/NAS/DINObotPose2/Dataset/Converted_dataset/DREAM_to_DREAM_syn/panda_synth_train_dr"  # Training data directory
 DATA_DIR="/home/najo/NAS/DIP/2025_ICRA_Multi_View_Robot_Pose_Estimation/dataset/Converted_dataset/DREAM_to_DREAM_syn/panda_synth_train_dr"  # Training data directory
-TRAIN_SPLIT=0.9  # Train/Val split ratio (0.9 = 90% train, 10% val)
+VAL_DIR="/home/najo/NAS/DIP/2025_ICRA_Multi_View_Robot_Pose_Estimation/dataset/DREAM_syn/panda_synth_test_dr"  # Validation data directory (separate from training)
+TRAIN_SPLIT=1.0  # Train split ratio (1.0 = use all training data when VAL_DIR is specified)
+VAL_SPLIT=0.1  # Validation data usage ratio (0.1 = use 10% of validation data)
 
 # Model configuration
 MODEL_NAME='facebook/dinov3-vitb16-pretrain-lvd1689m'
@@ -41,6 +43,9 @@ LEARNING_RATE=1e-3
 MIN_LR=1e-8
 WEIGHT_DECAY=1e-5
 SCHEDULER="cosine"  # Options: step, cosine, plateau, none
+
+# Loss configuration
+LOSS_TYPE="smoothl1"  # Loss function type: mse, l1, smoothl1 (smoothl1 recommended for ADD AUC)
 
 # Loss weights
 HEATMAP_WEIGHT=1.0
@@ -114,11 +119,17 @@ BASE_CMD="python train.py \
     --min-lr ${MIN_LR} \
     --weight-decay ${WEIGHT_DECAY} \
     --scheduler ${SCHEDULER} \
+    --loss-type ${LOSS_TYPE} \
     --heatmap-weight ${HEATMAP_WEIGHT} \
     --kp3d-weight ${KP3D_WEIGHT} \
     --output-dir ${OUTPUT_DIR} \
     --wandb-project ${WANDB_PROJECT} \
     --seed ${SEED}"
+
+# Add validation directory if specified
+if [ -n "${VAL_DIR}" ]; then
+    BASE_CMD="${BASE_CMD} --val-dir ${VAL_DIR} --val-split ${VAL_SPLIT}"
+fi
 
 # Add FDA flags
 if [ -n "${FDA_REAL_DIR}" ] && [ "${FDA_PROB}" != "0.0" ]; then
@@ -166,6 +177,7 @@ elif [ "${TRAIN_MODE}" = "multi_gpu" ]; then
         train.py \
         --data-dir ${DATA_DIR} \
         --train-split ${TRAIN_SPLIT} \
+        $([ -n "${VAL_DIR}" ] && echo "--val-dir ${VAL_DIR} --val-split ${VAL_SPLIT}") \
         --model-name ${MODEL_NAME} \
         --image-size ${IMAGE_SIZE} \
         --heatmap-size ${HEATMAP_SIZE} \
@@ -181,6 +193,7 @@ elif [ "${TRAIN_MODE}" = "multi_gpu" ]; then
         --min-lr ${MIN_LR} \
         --weight-decay ${WEIGHT_DECAY} \
         --scheduler ${SCHEDULER} \
+        --loss-type ${LOSS_TYPE} \
         --heatmap-weight ${HEATMAP_WEIGHT} \
         --kp3d-weight ${KP3D_WEIGHT} \
         --output-dir ${OUTPUT_DIR} \

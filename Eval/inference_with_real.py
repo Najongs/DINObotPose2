@@ -16,6 +16,7 @@ import numpy as np
 import torch
 import torchvision.transforms as TVTransforms
 import yaml
+import cv2
 
 # Import DREAM utilities
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../DREAM')))
@@ -39,7 +40,7 @@ def get_keypoints_from_heatmaps(heatmaps_tensor):
 
 def transform_robot_to_camera(robot_kpts, pred_2d, camera_K):
     """
-    Transform robot frame keypoints to camera frame using PnP.
+    Transform robot frame keypoints to camera frame using EPnP.
 
     Args:
         robot_kpts: (N, 3) keypoints in robot frame
@@ -49,22 +50,42 @@ def transform_robot_to_camera(robot_kpts, pred_2d, camera_K):
     Returns:
         camera_kpts: (N, 3) keypoints in camera frame (or None if PnP fails)
     """
-    # Solve PnP to get robot-to-camera transform
-    pnp_retval, translation, quaternion = dream.geometric_vision.solve_pnp(
-        robot_kpts, pred_2d, camera_K
-    )
+    try:
+        # EPnP requires at least 4 points
+        if len(robot_kpts) < 4:
+            print(f"Warning: PnP requires at least 4 points, got {len(robot_kpts)}")
+            return None
 
-    if not pnp_retval:
+        # Ensure correct data types
+        robot_kpts = robot_kpts.astype(np.float64)
+        pred_2d = pred_2d.astype(np.float64)
+        camera_K = camera_K.astype(np.float64)
+
+        # Solve PnP with EPnP algorithm
+        success, rvec, tvec = cv2.solvePnP(
+            robot_kpts,
+            pred_2d,
+            camera_K,
+            None,  # No distortion
+            flags=cv2.SOLVEPNP_EPNP  # Use EPnP algorithm
+        )
+
+        if not success:
+            print("Warning: EPnP failed to find solution")
+            return None
+
+        # Convert rotation vector to rotation matrix
+        R, _ = cv2.Rodrigues(rvec)
+        t = tvec.flatten()
+
+        # Transform: camera_frame = R @ robot_frame + t
+        camera_kpts = (R @ robot_kpts.T).T + t.reshape(1, 3)
+
+        return camera_kpts
+
+    except Exception as e:
+        print(f"Warning: PnP failed with error: {e}")
         return None
-
-    # Convert quaternion to rotation matrix
-    from scipy.spatial.transform import Rotation
-    R = Rotation.from_quat(quaternion).as_matrix()  # (3, 3)
-
-    # Transform: camera_frame = R @ robot_frame + t
-    camera_kpts = (R @ robot_kpts.T).T + translation.reshape(1, 3)
-
-    return camera_kpts
 
 
 def load_annotation(json_path, keypoint_names):

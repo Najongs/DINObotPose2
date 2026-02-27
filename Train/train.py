@@ -24,9 +24,7 @@ import yaml
 import wandb
 import cv2
 
-from model import (DINOv3PoseEstimator, panda_forward_kinematics,
-                    IterativeRefinementModule)
-from dataset import PoseEstimationDataset, create_dataloaders
+from model import DINOv3PoseEstimator, panda_forward_kinematics
 
 import sys
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../DREAM')))
@@ -94,31 +92,6 @@ def get_keypoints_from_heatmaps(heatmaps):
     x = max_indices % W
 
     return torch.stack([x, y], dim=-1).float()
-
-
-def soft_argmax_2d(heatmaps, temperature=10.0):
-    """
-    Differentiable soft-argmax to extract (u, v) from heatmaps for PnP.
-    Args:
-        heatmaps: (B, N, H, W)
-        temperature: scaling factor for softmax sharpness
-    Returns:
-        (B, N, 2) [x, y] coordinates in heatmap pixel space
-    """
-    B, N, H, W = heatmaps.shape
-    device = heatmaps.device
-
-    x_coords = torch.arange(W, device=device, dtype=torch.float32)
-    y_coords = torch.arange(H, device=device, dtype=torch.float32)
-
-    heatmaps_flat = heatmaps.reshape(B, N, -1)
-    weights = torch.softmax(heatmaps_flat * temperature, dim=-1)
-    weights = weights.reshape(B, N, H, W)
-
-    x = (weights.sum(dim=2) * x_coords).sum(dim=-1)  # (B, N)
-    y = (weights.sum(dim=3) * y_coords).sum(dim=-1)  # (B, N)
-
-    return torch.stack([x, y], dim=-1)  # (B, N, 2)
 
 
 class UnifiedPoseLoss(nn.Module):
@@ -588,6 +561,69 @@ class Trainer:
                 except Exception as e:
                     print(f"Error removing old checkpoint {old_ckpt}: {e}")
 
+    def _prepare_batch(self, batch):
+        """batch를 device로 이동하고 gt_dict, forward kwargs 구성"""
+        images = batch['image'].to(self.device)
+        gt_heatmaps = batch['heatmaps'].to(self.device)
+        gt_keypoints_3d = batch['keypoints_3d'].to(self.device)
+        gt_valid_mask = batch['valid_mask'].to(self.device)
+        gt_keypoints_2d = batch['keypoints'].to(self.device) if 'keypoints' in batch else None
+        camera_K = batch['camera_K'].to(self.device) if 'camera_K' in batch else None
+        original_size = batch['original_size'].to(self.device) if 'original_size' in batch else None
+        gt_angles = batch['angles'].to(self.device) if 'angles' in batch else None
+
+        # GT 2D → original image coords for refinement
+        gt_2d_image = None
+        if gt_keypoints_2d is not None and original_size is not None:
+            hm_size = self.config.get('heatmap_size', 512)
+            scale_x = original_size[:, 0:1] / hm_size
+            scale_y = original_size[:, 1:2] / hm_size
+            gt_2d_image = torch.stack([
+                gt_keypoints_2d[:, :, 0] * scale_x,
+                gt_keypoints_2d[:, :, 1] * scale_y,
+            ], dim=-1)
+
+        gt_dict = {
+            'heatmaps_2d': gt_heatmaps,
+            'keypoints_3d': gt_keypoints_3d,
+            'valid_mask': gt_valid_mask,
+        }
+        if gt_angles is not None:
+            gt_dict['angles'] = gt_angles
+        if gt_keypoints_2d is not None:
+            gt_dict['keypoints'] = gt_keypoints_2d
+        if camera_K is not None:
+            gt_dict['camera_K'] = camera_K
+        if original_size is not None:
+            gt_dict['original_size'] = original_size
+
+        orig_size_list = original_size[0].tolist() if original_size is not None else None
+
+        return images, gt_dict, camera_K, orig_size_list, gt_angles, gt_2d_image
+
+    # Mapping from loss_dict keys to short display names
+    _LOSS_EXTRA_KEYS = [('angle', 'ang'), ('fk_3d', 'fk'), ('camera_3d', 'cam3d'), ('refinement', 'ref')]
+
+    def _format_postfix(self, loss_dict):
+        """loss_dict → tqdm postfix dict"""
+        postfix = {
+            'loss': f"{loss_dict['total']:.6f}",
+            'hm': f"{loss_dict['heatmap']:.6f}",
+            'kp3d': f"{loss_dict['kp3d']:.6f}",
+        }
+        for key, short in self._LOSS_EXTRA_KEYS:
+            if key in loss_dict:
+                postfix[short] = f"{loss_dict[key]:.6f}"
+        return postfix
+
+    def _format_loss_extra(self, losses):
+        """epoch summary용 extra loss 문자열"""
+        parts = []
+        for key, short in self._LOSS_EXTRA_KEYS:
+            if key in losses:
+                parts.append(f"{short}: {losses[key]:.6f}")
+        return ', '.join(parts)
+
     def train_epoch(self, epoch: int) -> Dict[str, float]:
         """Train for one epoch"""
         self.model.train()
@@ -611,53 +647,13 @@ class Trainer:
         batch_idx = 0
         for batch in pbar:
             batch_idx += 1
-            # Move data to device
-            images = batch['image'].to(self.device)
-            gt_heatmaps = batch['heatmaps'].to(self.device)
-            gt_keypoints_3d = batch['keypoints_3d'].to(self.device)
-            gt_valid_mask = batch['valid_mask'].to(self.device)
-            gt_keypoints_2d = batch['keypoints'].to(self.device) if 'keypoints' in batch else None
-
-            # Camera K and original size for depth_only and joint_angle modes
-            camera_K = batch['camera_K'].to(self.device) if 'camera_K' in batch else None
-            original_size = batch['original_size'].to(self.device) if 'original_size' in batch else None
-
-            # Joint angles for joint_angle mode
-            gt_angles = batch['angles'].to(self.device) if 'angles' in batch else None
-
-            # Prepare GT 2D in original image coords for refinement module
-            gt_2d_image = None
-            if gt_keypoints_2d is not None and original_size is not None:
-                H_hm = self.config.get('heatmap_size', 512)
-                W_hm = H_hm
-                scale_x = original_size[:, 0:1] / W_hm  # (B, 1)
-                scale_y = original_size[:, 1:2] / H_hm  # (B, 1)
-                gt_2d_image = torch.stack([
-                    gt_keypoints_2d[:, :, 0] * scale_x,
-                    gt_keypoints_2d[:, :, 1] * scale_y,
-                ], dim=-1)  # (B, 7, 2) in original image coords
+            images, gt_dict, camera_K, orig_size_list, gt_angles, gt_2d_image = self._prepare_batch(batch)
 
             # Forward pass
-            orig_size_list = original_size[0].tolist() if original_size is not None else None
             pred_dict = self.model(
                 images, camera_K=camera_K, original_size=orig_size_list,
                 gt_angles=gt_angles, gt_2d_image=gt_2d_image
             )
-
-            # Prepare ground truth dictionary
-            gt_dict = {
-                'heatmaps_2d': gt_heatmaps,
-                'keypoints_3d': gt_keypoints_3d,
-                'valid_mask': gt_valid_mask
-            }
-            if gt_angles is not None:
-                gt_dict['angles'] = gt_angles
-            if gt_keypoints_2d is not None:
-                gt_dict['keypoints'] = gt_keypoints_2d
-            if camera_K is not None:
-                gt_dict['camera_K'] = camera_K
-            if original_size is not None:
-                gt_dict['original_size'] = original_size
 
             # Compute loss
             loss, loss_dict = self.criterion(pred_dict, gt_dict)
@@ -676,20 +672,7 @@ class Trainer:
 
             # Update progress bar (only on main process)
             if self.is_main_process:
-                postfix = {
-                    'loss': f"{loss_dict['total']:.6f}",
-                    'hm': f"{loss_dict['heatmap']:.6f}",
-                    'kp3d': f"{loss_dict['kp3d']:.6f}"
-                }
-                if 'angle' in loss_dict:
-                    postfix['ang'] = f"{loss_dict['angle']:.6f}"
-                if 'fk_3d' in loss_dict:
-                    postfix['fk'] = f"{loss_dict['fk_3d']:.6f}"
-                if 'camera_3d' in loss_dict:
-                    postfix['cam3d'] = f"{loss_dict['camera_3d']:.6f}"
-                if 'refinement' in loss_dict:
-                    postfix['ref'] = f"{loss_dict['refinement']:.6f}"
-                pbar.set_postfix(postfix)
+                pbar.set_postfix(self._format_postfix(loss_dict))
 
                 # Log batch losses to wandb every N batches
                 if wandb.run is not None and batch_idx % 10 == 0:
@@ -698,18 +681,15 @@ class Trainer:
                         batch_log = {
                             'batch/train_loss': loss_dict['total'],
                             'batch/train_heatmap_loss': loss_dict['heatmap'],
-                            'batch/train_kp3d_loss': loss_dict['kp3d']
+                            'batch/train_kp3d_loss': loss_dict['kp3d'],
                         }
-                        if 'angle' in loss_dict:
-                            batch_log['batch/train_angle_loss'] = loss_dict['angle']
-                        if 'fk_3d' in loss_dict:
-                            batch_log['batch/train_fk3d_loss'] = loss_dict['fk_3d']
-                        if 'camera_3d' in loss_dict:
-                            batch_log['batch/train_camera3d_loss'] = loss_dict['camera_3d']
-                        if 'pnp_success_rate' in loss_dict:
-                            batch_log['batch/pnp_success_rate'] = loss_dict['pnp_success_rate']
-                        if 'refinement' in loss_dict:
-                            batch_log['batch/train_refinement_loss'] = loss_dict['refinement']
+                        for key, wandb_key in [('angle', 'batch/train_angle_loss'),
+                                                ('fk_3d', 'batch/train_fk3d_loss'),
+                                                ('camera_3d', 'batch/train_camera3d_loss'),
+                                                ('pnp_success_rate', 'batch/pnp_success_rate'),
+                                                ('refinement', 'batch/train_refinement_loss')]:
+                            if key in loss_dict:
+                                batch_log[wandb_key] = loss_dict[key]
                         wandb.log(batch_log, step=global_step)
                     except Exception:
                         pass  # Silently ignore batch logging errors

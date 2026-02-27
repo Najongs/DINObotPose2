@@ -504,13 +504,27 @@ class Trainer:
             if not missing_keys and not unexpected_keys:
                 print("✓ All model parameters loaded successfully")
 
-        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-
-        if self.scheduler and 'scheduler_state_dict' in checkpoint:
-            self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        # Try to load optimizer state (may fail if model structure changed)
+        try:
+            self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
             if self.is_main_process:
-                current_lr = self.optimizer.param_groups[0]['lr']
-                print(f"Scheduler state restored. Current LR: {current_lr:.2e}")
+                print("✓ Optimizer state restored")
+        except (ValueError, KeyError) as e:
+            if self.is_main_process:
+                print(f"⚠️  Failed to load optimizer state (model structure may have changed): {e}")
+                print("   Optimizer will start with fresh state")
+
+        # Try to load scheduler state (may fail if optimizer state failed to load)
+        if self.scheduler and 'scheduler_state_dict' in checkpoint:
+            try:
+                self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+                if self.is_main_process:
+                    current_lr = self.optimizer.param_groups[0]['lr']
+                    print(f"✓ Scheduler state restored. Current LR: {current_lr:.2e}")
+            except (ValueError, KeyError) as e:
+                if self.is_main_process:
+                    print(f"⚠️  Failed to load scheduler state: {e}")
+                    print("   Scheduler will start with fresh state")
 
         self.start_epoch = checkpoint.get('epoch', 0) + 1
         self.best_val_loss = checkpoint.get('best_val_loss', float('inf'))

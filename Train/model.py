@@ -368,11 +368,12 @@ class JointAngleHead(nn.Module):
     Uses FK to produce 3D keypoints in robot base frame.
     """
 
-    def __init__(self, input_dim=FEATURE_DIM, num_joints=NUM_JOINTS, num_angles=7):
+    def __init__(self, input_dim=FEATURE_DIM, num_joints=NUM_JOINTS, num_angles=7, use_joint_embedding=False):
         super().__init__()
         self.num_joints = num_joints
         self.num_angles = num_angles
         self.hidden_dim = 256
+        self.use_joint_embedding = use_joint_embedding
 
         # Joint limits as buffers
         limits = torch.tensor(_PANDA_JOINT_LIMITS, dtype=torch.float32)  # (7, 2)
@@ -391,6 +392,10 @@ class JointAngleHead(nn.Module):
             nn.GELU(),
             nn.LayerNorm(self.hidden_dim)
         )
+
+        # Joint identity embedding: "이 토큰은 1번 모터(Base)입니다" / "이 토큰은 7번 모터(Wrist)입니다"
+        if use_joint_embedding:
+            self.joint_embedding = nn.Embedding(num_joints, self.hidden_dim)
 
         # 2. Self-attention for kinematic constraint learning (reduced from 4 to 2 layers)
         encoder_layer = nn.TransformerEncoderLayer(
@@ -460,8 +465,17 @@ class JointAngleHead(nn.Module):
         # Concatenate 2D coordinates
         joint_features = torch.cat([joint_features, uv_normalized], dim=-1)  # (B, NJ, D+2)
 
-        # Feature refinement + self-attention
+        # Feature refinement
         refined = self.joint_feature_net(joint_features)  # (B, NJ, 256)
+
+        # Add joint identity embedding: "이 토큰은 1번 모터(Base)입니다" / "이 토큰은 7번 모터(Wrist)입니다"
+        # Without this, the transformer must infer joint identity from visual features alone!
+        if self.use_joint_embedding:
+            joint_ids = torch.arange(self.num_joints, device=dino_features.device).expand(b, self.num_joints)
+            joint_embeds = self.joint_embedding(joint_ids)  # (B, NJ, 256)
+            refined = refined + joint_embeds  # 시각+공간 특징에 이름표를 더함!
+
+        # Self-attention for kinematic constraint learning
         related = self.joint_relation_net(refined)  # (B, NJ, 256)
 
         # Global pooling: aggregate all joint tokens into single robot state
@@ -695,7 +709,8 @@ class DINOv3PoseEstimator(nn.Module):
         self.joint_angle_head = JointAngleHead(
             input_dim=feature_dim,
             num_joints=NUM_JOINTS,
-            num_angles=7
+            num_angles=7,
+            use_joint_embedding=use_joint_embedding
         )
 
         # 3. Iterative Refinement Module (optional)

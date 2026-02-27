@@ -48,7 +48,7 @@ FDA_BETA=0.001   # Low-freq replacement ratio (0.01=subtle tone shift, 0.05=stro
 FDA_PROB=0.5    # Probability of applying FDA per sample (0.0 to disable)
 
 # Training hyperparameters
-EPOCHS=50
+EPOCHS=100
 BATCH_SIZE=16
 NUM_WORKERS=4
 OPTIMIZER="adam"  # Options: adam, adamw, sgd
@@ -67,7 +67,8 @@ WANDB_RUN_NAME="dinov3_base_$(date +%Y%m%d_%H%M%S)"
 
 # Other settings
 SEED=42
-RESUME="/home/najo/NAS/DIP/DINObotPose2/Train/outputs/dinov3_base_20260227_151148/epoch_47.pth"  # Path to checkpoint for resuming (leave empty for new training)
+RESUME="/home/najo/NAS/DIP/DINObotPose2/Train/outputs/dinov3_base_20260227_174837/epoch_49.pth"  # Path to checkpoint for resuming (leave empty for new training)
+RESUME_LR="1e-4"  # Learning rate to use when resuming (leave empty for automatic calculation from scheduler)
 LOAD_2D_HEAD=""  # Path to checkpoint for loading pretrained 2D heatmap head (leave empty to train from scratch)
 
 # =============================================================================
@@ -149,6 +150,11 @@ if [ -n "${RESUME}" ]; then
     BASE_CMD="${BASE_CMD} --resume ${RESUME}"
 fi
 
+# Add resume learning rate if specified
+if [ -n "${RESUME_LR}" ]; then
+    BASE_CMD="${BASE_CMD} --resume-lr ${RESUME_LR}"
+fi
+
 # Add pretrained 2D head checkpoint if specified
 if [ -n "${LOAD_2D_HEAD}" ]; then
     BASE_CMD="${BASE_CMD} --load-2d-head ${LOAD_2D_HEAD}"
@@ -204,6 +210,7 @@ elif [ "${TRAIN_MODE}" = "multi_gpu" ]; then
         --wandb-project ${WANDB_PROJECT} \
         $([ -n "${WANDB_RUN_NAME}" ] && echo "--wandb-run-name ${WANDB_RUN_NAME}") \
         $([ -n "${RESUME}" ] && echo "--resume ${RESUME}") \
+        $([ -n "${RESUME_LR}" ] && echo "--resume-lr ${RESUME_LR}") \
         $([ -n "${LOAD_2D_HEAD}" ] && echo "--load-2d-head ${LOAD_2D_HEAD}") \
         $([ -n "${FDA_REAL_DIR}" ] && [ "${FDA_PROB}" != "0.0" ] && echo "--fda-real-dir ${FDA_REAL_DIR} --fda-beta ${FDA_BETA} --fda-prob ${FDA_PROB}") \
         --seed ${SEED}

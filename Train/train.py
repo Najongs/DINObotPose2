@@ -410,6 +410,7 @@ class Trainer:
         camera_K: Optional[np.ndarray] = None,
         raw_res: Tuple[int, int] = (640, 480),
         resume_from: Optional[str] = None,
+        resume_lr: Optional[float] = None,
         local_rank: int = -1
     ):
         self.model = model
@@ -423,6 +424,7 @@ class Trainer:
         self.config = config
         self.camera_K = camera_K
         self.raw_res = raw_res
+        self.resume_lr = resume_lr
         self.local_rank = local_rank
         self.is_distributed = local_rank != -1
         self.is_main_process = (not self.is_distributed) or (local_rank == 0)
@@ -473,6 +475,51 @@ class Trainer:
             with open(self.output_dir / 'config.yaml', 'w') as f:
                 yaml.dump(config, f)
 
+    def _calculate_target_lr_at_epoch(self, epoch: int) -> float:
+        """Calculate target LR at given epoch based on scheduler type"""
+        import torch.optim as optim
+        from torch.optim.lr_scheduler import SequentialLR, LinearLR
+
+        # Get base LR from optimizer
+        base_lr = self.optimizer.param_groups[0]['initial_lr'] if 'initial_lr' in self.optimizer.param_groups[0] else self.optimizer.param_groups[0]['lr']
+
+        # Calculate based on scheduler type
+        if isinstance(self.scheduler, optim.lr_scheduler.CosineAnnealingLR):
+            # Cosine annealing formula: eta_min + (base_lr - eta_min) * (1 + cos(pi * epoch / T_max)) / 2
+            T_max = self.scheduler.T_max
+            eta_min = self.scheduler.eta_min
+            import math
+            return eta_min + (base_lr - eta_min) * (1 + math.cos(math.pi * epoch / T_max)) / 2
+
+        elif isinstance(self.scheduler, SequentialLR):
+            # SequentialLR with warmup + cosine
+            # Check if we're still in warmup
+            milestones = self.scheduler._milestones
+            if epoch < milestones[0]:
+                # In warmup phase (LinearLR)
+                warmup_scheduler = self.scheduler._schedulers[0]
+                start_factor = warmup_scheduler.start_factor
+                total_iters = warmup_scheduler.total_iters
+                return base_lr * (start_factor + (1 - start_factor) * epoch / total_iters)
+            else:
+                # In cosine phase
+                cosine_scheduler = self.scheduler._schedulers[1]
+                T_max = cosine_scheduler.T_max
+                eta_min = cosine_scheduler.eta_min
+                epoch_in_cosine = epoch - milestones[0]
+                import math
+                return eta_min + (base_lr - eta_min) * (1 + math.cos(math.pi * epoch_in_cosine / T_max)) / 2
+
+        elif isinstance(self.scheduler, optim.lr_scheduler.StepLR):
+            # StepLR: gamma ** (epoch // step_size)
+            step_size = self.scheduler.step_size
+            gamma = self.scheduler.gamma
+            return base_lr * (gamma ** (epoch // step_size))
+
+        else:
+            # Unknown scheduler, return current LR
+            return self.optimizer.param_groups[0]['lr']
+
     def _load_checkpoint(self, checkpoint_path: str):
         """Load checkpoint for resuming training"""
         if self.is_main_process:
@@ -489,8 +536,25 @@ class Trainer:
             # Remove 'module.' prefix if loading DDP checkpoint into non-DDP model
             state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
 
+        # Filter out keys with shape mismatch (e.g., after architecture changes like PixelShuffle)
+        model_state_dict = self.model.state_dict()
+        filtered_state_dict = {}
+        shape_mismatch_keys = []
+
+        for key, value in state_dict.items():
+            if key in model_state_dict:
+                if value.shape == model_state_dict[key].shape:
+                    filtered_state_dict[key] = value
+                else:
+                    shape_mismatch_keys.append(key)
+                    if self.is_main_process:
+                        print(f"⚠️  Shape mismatch for {key}: checkpoint {value.shape} vs model {model_state_dict[key].shape}")
+            else:
+                # Key doesn't exist in current model (will be handled as unexpected_keys)
+                filtered_state_dict[key] = value
+
         # Load model state with strict=False to allow partial loading (missing keys will be randomly initialized)
-        missing_keys, unexpected_keys = self.model.load_state_dict(state_dict, strict=False)
+        missing_keys, unexpected_keys = self.model.load_state_dict(filtered_state_dict, strict=False)
 
         if self.is_main_process:
             if missing_keys:
@@ -514,25 +578,80 @@ class Trainer:
                 print(f"⚠️  Failed to load optimizer state (model structure may have changed): {e}")
                 print("   Optimizer will start with fresh state")
 
-        # Try to load scheduler state (may fail if optimizer state failed to load)
-        if self.scheduler and 'scheduler_state_dict' in checkpoint:
-            try:
-                self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-                if self.is_main_process:
-                    current_lr = self.optimizer.param_groups[0]['lr']
-                    print(f"✓ Scheduler state restored. Current LR: {current_lr:.2e}")
-            except (ValueError, KeyError) as e:
-                if self.is_main_process:
-                    print(f"⚠️  Failed to load scheduler state: {e}")
-                    print("   Scheduler will start with fresh state")
-
+        # Load epoch and training state
         self.start_epoch = checkpoint.get('epoch', 0) + 1
         self.best_val_loss = checkpoint.get('best_val_loss', float('inf'))
         self.train_log = checkpoint.get('train_log', self.train_log)
 
+        # Handle learning rate on resume
+        if self.resume_lr is not None:
+            # Manual LR specified - override scheduler state
+            if self.is_main_process:
+                print(f"⚠️  Using manually specified resume LR: {self.resume_lr:.2e}")
+
+            # Set LR immediately
+            for param_group in self.optimizer.param_groups:
+                param_group['lr'] = self.resume_lr
+
+            # Try to load scheduler state but LR will be overridden
+            if self.scheduler and 'scheduler_state_dict' in checkpoint:
+                try:
+                    self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+                    if self.is_main_process:
+                        print(f"   → Scheduler state loaded (but LR overridden)")
+                except (ValueError, KeyError) as e:
+                    if self.is_main_process:
+                        print(f"   → Failed to load scheduler state: {e}")
+                    # Set scheduler's last_epoch to start_epoch - 1
+                    if self.scheduler:
+                        self.scheduler.last_epoch = self.start_epoch - 1
+            else:
+                # No scheduler state, set last_epoch
+                if self.scheduler:
+                    self.scheduler.last_epoch = self.start_epoch - 1
+
+            # Override LR again after scheduler load
+            for param_group in self.optimizer.param_groups:
+                param_group['lr'] = self.resume_lr
+
+        else:
+            # No manual LR - use scheduler state or calculate
+            scheduler_loaded = False
+            if self.scheduler and 'scheduler_state_dict' in checkpoint:
+                try:
+                    self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+                    scheduler_loaded = True
+                    if self.is_main_process:
+                        current_lr = self.optimizer.param_groups[0]['lr']
+                        print(f"✓ Scheduler state restored. Current LR: {current_lr:.2e}")
+                except (ValueError, KeyError) as e:
+                    if self.is_main_process:
+                        print(f"⚠️  Failed to load scheduler state: {e}")
+
+            # If scheduler state failed to load, calculate LR from scheduler
+            if self.scheduler and not scheduler_loaded:
+                if self.is_main_process:
+                    print(f"⚠️  Adjusting scheduler to resume from epoch {self.start_epoch}")
+
+                # Calculate target LR at start_epoch using scheduler formula
+                target_lr = self._calculate_target_lr_at_epoch(self.start_epoch)
+                if self.is_main_process:
+                    print(f"   → Calculated LR from scheduler: {target_lr:.2e}")
+
+                # Set LR to target value immediately
+                for param_group in self.optimizer.param_groups:
+                    param_group['lr'] = target_lr
+
+                # Set scheduler's last_epoch to start_epoch - 1 (so next step() gives correct LR)
+                self.scheduler.last_epoch = self.start_epoch - 1
+
         if self.is_main_process:
-            print(f"Resumed from epoch {self.start_epoch}")
-            print(f"Best validation loss so far: {self.best_val_loss:.4f}")
+            print(f"\n{'='*80}")
+            print(f"Resume Summary:")
+            print(f"  Starting from epoch: {self.start_epoch}")
+            print(f"  Best validation loss: {self.best_val_loss:.4f}")
+            print(f"  Current Learning Rate: {self.optimizer.param_groups[0]['lr']:.2e}")
+            print(f"{'='*80}\n")
 
     def _save_checkpoint(self, epoch: int, is_best: bool = False):
         """Save training checkpoint (only on main process)"""
@@ -620,10 +739,14 @@ class Trainer:
 
     def _format_postfix(self, loss_dict):
         """loss_dict → tqdm postfix dict"""
+        # Get current learning rate
+        current_lr = self.optimizer.param_groups[0]['lr']
+
         postfix = {
             'loss': f"{loss_dict['total']:.6f}",
             'hm': f"{loss_dict['heatmap']:.6f}",
             'kp3d': f"{loss_dict['kp3d']:.6f}",
+            'lr': f"{current_lr:.2e}",  # Show LR in scientific notation
         }
         for key, short in self._LOSS_EXTRA_KEYS:
             if key in loss_dict:
@@ -829,10 +952,12 @@ class Trainer:
 
             # Update progress bar (only on main process)
             if self.is_main_process:
+                current_lr = self.optimizer.param_groups[0]['lr']
                 postfix = {
                     'loss': f"{loss_dict['total']:.6f}",
                     'hm': f"{loss_dict['heatmap']:.6f}",
-                    'kp3d': f"{loss_dict['kp3d']:.6f}"
+                    'kp3d': f"{loss_dict['kp3d']:.6f}",
+                    'lr': f"{current_lr:.2e}"
                 }
                 if 'angle' in loss_dict:
                     postfix['ang'] = f"{loss_dict['angle']:.6f}"
@@ -937,6 +1062,13 @@ class Trainer:
         for epoch in range(self.start_epoch, num_epochs):
             epoch_start = time.time()
 
+            # Print current LR at start of epoch
+            current_lr = self.optimizer.param_groups[0]['lr']
+            if self.is_main_process:
+                print(f"\n{'='*80}")
+                print(f"Epoch {epoch}/{num_epochs-1} | Learning Rate: {current_lr:.2e}")
+                print(f"{'='*80}")
+
             # Train
             train_losses = self.train_epoch(epoch)
 
@@ -1011,7 +1143,7 @@ class Trainer:
                     print(f"  Val ADD AUC: {val_losses['val_add_auc']:.4f}, ADD Mean: {val_losses['val_add_mean_mm']:.2f}mm, PnP Succ: {val_losses['val_pnp_success_rate']:.2%}")
                 if 'val_pck_auc' in val_losses:
                     print(f"  Val PCK AUC: {val_losses['val_pck_auc']:.4f}, KP Mean Err: {val_losses['val_kp_mean_err_px']:.2f}px")
-                print(f"  Learning Rate: {current_lr:.8f}")
+                print(f"  Learning Rate: {current_lr:.2e}")
                 print(f"  Time: {epoch_time:.2f}s")
 
             # Save checkpoint (only on main process)
@@ -1584,6 +1716,7 @@ def main(args):
         camera_K=camera_K,
         raw_res=raw_res,
         resume_from=args.resume,
+        resume_lr=args.resume_lr,
         local_rank=local_rank
     )
 
@@ -1689,6 +1822,8 @@ if __name__ == '__main__':
     # Resume
     parser.add_argument('--resume', type=str, default=None,
                         help='Path to checkpoint to resume from')
+    parser.add_argument('--resume-lr', type=float, default=None,
+                        help='Learning rate to use when resuming (if not specified, calculated from scheduler)')
 
     # Load pretrained 2D heatmap head
     parser.add_argument('--load-2d-head', type=str, default=None,

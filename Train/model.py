@@ -131,33 +131,36 @@ class ViTKeypointHead(nn.Module):
         self.heatmap_size = heatmap_size
         self.token_fuser = TokenFuser(input_dim, 256)
 
-        # ViT-only decoder with adaptive normalization
+        # ViT-only decoder with Sub-Pixel Convolution (PixelShuffle)
+        # PixelShuffle: 초해상도 표준 기법, edge 보존 우수, checkerboard artifact 없음
         self.decoder_block1 = nn.Sequential(
-            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True),
-            nn.Conv2d(256, 128, kernel_size=3, padding=1, bias=False),
+            nn.Conv2d(256, 128 * 4, kernel_size=3, padding=1, bias=False),  # 4 = 2^2 for 2x upsampling
+            nn.PixelShuffle(upscale_factor=2),  # (B, 128*4, H, W) -> (B, 128, H*2, W*2)
             AdaptiveNorm2d(128, num_groups=32),
             nn.GELU()
         )
         self.decoder_block2 = nn.Sequential(
-            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True),
-            nn.Conv2d(128, 64, kernel_size=3, padding=1, bias=False),
+            nn.Conv2d(128, 64 * 4, kernel_size=3, padding=1, bias=False),
+            nn.PixelShuffle(upscale_factor=2),  # 2x upsampling
             AdaptiveNorm2d(64, num_groups=16),
             nn.GELU()
         )
         self.decoder_block3 = nn.Sequential(
-            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True),
-            nn.Conv2d(64, 32, kernel_size=3, padding=1, bias=False),
+            nn.Conv2d(64, 32 * 4, kernel_size=3, padding=1, bias=False),
+            nn.PixelShuffle(upscale_factor=2),  # 2x upsampling
             AdaptiveNorm2d(32, num_groups=8),
             nn.GELU()
         )
 
         self.heatmap_predictor = nn.Conv2d(32, num_joints, kernel_size=3, padding=1)
 
-        # Learned upsampling with transposed convolution (better than bilinear)
-        # From 32x32 (after 3 decoder blocks) to 512x512 requires 4x upsampling
+        # Final upsampling with Sub-Pixel Convolution (4x = 2x × 2x)
+        # PixelShuffle은 ConvTranspose2d보다 checkerboard artifact가 적고 edge detail 보존 우수
         self.final_upsample = nn.Sequential(
-            nn.ConvTranspose2d(num_joints, num_joints, kernel_size=4, stride=2, padding=1, bias=False),
-            nn.ConvTranspose2d(num_joints, num_joints, kernel_size=4, stride=2, padding=1, bias=False)
+            nn.Conv2d(num_joints, num_joints * 4, kernel_size=3, padding=1, bias=False),
+            nn.PixelShuffle(upscale_factor=2),  # 2x upsampling
+            nn.Conv2d(num_joints, num_joints * 4, kernel_size=3, padding=1, bias=False),
+            nn.PixelShuffle(upscale_factor=2)   # 2x upsampling (total 4x)
         )
 
     def forward(self, dino_features):

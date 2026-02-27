@@ -40,6 +40,7 @@ REFINEMENT_WEIGHT=50.0         # Refinement loss weight
 # Loss weights
 HEATMAP_WEIGHT=1.0
 KP3D_WEIGHT=100.0
+HEATMAP_ONLY_TRAIN=True  # True: train only 2D heatmap branch
 
 # FDA (Fourier Domain Adaptation) for sim-to-real
 FDA_REAL_DIR="/data/public/NAS/DINObotPose2/Dataset/DREAM_real"  # Real images (no labels needed)
@@ -70,7 +71,7 @@ WANDB_RUN_NAME="dinov3_base_$(date +%Y%m%d_%H%M%S)"
 # Other settings
 SEED=42
 RESUME=""  # Path to checkpoint for resuming (leave empty for new training)
-RESUME_LR="1e-3"  # Learning rate to use when resuming (leave empty for automatic calculation from scheduler)
+RESUME_LR=""  # Learning rate to use when resuming (leave empty for automatic calculation from scheduler)
 LOAD_2D_HEAD=""  # Path to checkpoint for loading pretrained 2D heatmap head (leave empty to train from scratch)
 
 # =============================================================================
@@ -105,6 +106,13 @@ else
     REFINEMENT_FLAG=""
 fi
 
+# Build heatmap-only training flag
+if [ "${HEATMAP_ONLY_TRAIN}" = "True" ] || [ "${HEATMAP_ONLY_TRAIN}" = "true" ]; then
+    HEATMAP_ONLY_FLAG="--heatmap-only-train"
+else
+    HEATMAP_ONLY_FLAG=""
+fi
+
 # Build base command
 BASE_CMD="python train.py \
     --data-dir ${DATA_DIR} \
@@ -114,6 +122,7 @@ BASE_CMD="python train.py \
     --heatmap-size ${HEATMAP_SIZE} \
     --unfreeze-blocks ${UNFREEZE_BLOCKS} \
     ${JOINT_EMBEDDING_FLAG} \
+    ${HEATMAP_ONLY_FLAG} \
     --angle-weight ${ANGLE_WEIGHT} \
     --fk-3d-weight ${FK_3D_WEIGHT} \
     ${REFINEMENT_FLAG} \
@@ -196,6 +205,7 @@ elif [ "${TRAIN_MODE}" = "multi_gpu" ]; then
         --heatmap-size ${HEATMAP_SIZE} \
         --unfreeze-blocks ${UNFREEZE_BLOCKS} \
         ${JOINT_EMBEDDING_FLAG} \
+        ${HEATMAP_ONLY_FLAG} \
         --angle-weight ${ANGLE_WEIGHT} \
         --fk-3d-weight ${FK_3D_WEIGHT} \
         ${REFINEMENT_FLAG} \

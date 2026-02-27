@@ -1563,16 +1563,20 @@ def main(args):
             if is_main_process:
                 print(f"Warning: Failed to load camera settings: {e}")
 
+    use_iter_refine = getattr(args, 'use_iterative_refinement', False)
+    heatmap_only_train = getattr(args, 'heatmap_only_train', False)
+    effective_use_iter_refine = use_iter_refine and not heatmap_only_train
+
     if is_main_process:
         print(f"3D prediction mode: joint_angle")
         print(
             f"Optimization config: optimizer={args.optimizer}, "
             f"scheduler={args.scheduler}, lr={args.learning_rate:.2e}, "
             f"warmup_steps={args.warmup_steps}, warmup_start_lr={args.warmup_start_lr:.2e}, "
+            f"heatmap_only={'yes' if heatmap_only_train else 'no'}, "
             f"resume={'yes' if args.resume else 'no'}"
         )
 
-    use_iter_refine = getattr(args, 'use_iterative_refinement', False)
     refine_iters = getattr(args, 'refinement_iterations', 3)
 
     model = DINOv3PoseEstimator(
@@ -1580,9 +1584,17 @@ def main(args):
         heatmap_size=(args.heatmap_size, args.heatmap_size),
         unfreeze_blocks=args.unfreeze_blocks,
         use_joint_embedding=args.use_joint_embedding,
-        use_iterative_refinement=use_iter_refine,
+        use_iterative_refinement=effective_use_iter_refine,
         refinement_iterations=refine_iters,
     ).to(device)
+
+    # 2D heatmap-only training: freeze 3D-related heads
+    if heatmap_only_train:
+        for p in model.joint_angle_head.parameters():
+            p.requires_grad = False
+        if model.refinement_module is not None:
+            for p in model.refinement_module.parameters():
+                p.requires_grad = False
 
     # Wrap model with DistributedDataParallel for multi-GPU training
     if is_distributed:
@@ -1590,7 +1602,7 @@ def main(args):
             model,
             device_ids=[local_rank],
             output_device=local_rank,
-            find_unused_parameters=use_iter_refine,  # refinement module may have unused params
+            find_unused_parameters=effective_use_iter_refine,  # refinement module may have unused params
             broadcast_buffers=True,
             gradient_as_bucket_view=True  # gradient stride 경고 완화
         )
@@ -1598,6 +1610,7 @@ def main(args):
     if is_main_process:
         print(f"Model: {args.model_name}")
         print(f"Joint Embedding: {'Enabled' if args.use_joint_embedding else 'Disabled'}")
+        print(f"Training Mode: {'2D heatmap-only' if heatmap_only_train else 'Full (2D + 3D)'}")
         print(f"Fine-tuning: Partial (Last {args.unfreeze_blocks} blocks)")
 
         model_to_count = model.module if is_distributed else model
@@ -1614,10 +1627,10 @@ def main(args):
         )
 
     # Loss function
-    angle_w = args.angle_weight
-    fk_3d_w = args.fk_3d_weight
-    camera_3d_w = args.kp3d_weight  # Camera-frame 3D loss (PnP-based transform)
-    refinement_w = getattr(args, 'refinement_weight', 0.0) if use_iter_refine else 0.0
+    angle_w = 0.0 if heatmap_only_train else args.angle_weight
+    fk_3d_w = 0.0 if heatmap_only_train else args.fk_3d_weight
+    camera_3d_w = 0.0 if heatmap_only_train else args.kp3d_weight  # Camera-frame 3D loss
+    refinement_w = 0.0 if heatmap_only_train else (getattr(args, 'refinement_weight', 0.0) if effective_use_iter_refine else 0.0)
     criterion = UnifiedPoseLoss(
         heatmap_weight=args.heatmap_weight,
         kp3d_weight=0.0,  # Not used in joint_angle mode (use angle/FK/camera_3d losses instead)
@@ -1688,9 +1701,10 @@ def main(args):
         'unfreeze_blocks': args.unfreeze_blocks,
         'use_joint_embedding': args.use_joint_embedding,
         'joint_angle_3d': True,
+        'heatmap_only_train': heatmap_only_train,
         'angle_weight': angle_w,
         'fk_3d_weight': fk_3d_w,
-        'use_iterative_refinement': use_iter_refine,
+        'use_iterative_refinement': effective_use_iter_refine,
         'refinement_iterations': refine_iters,
         'refinement_weight': refinement_w,
         'batch_size': args.batch_size,
@@ -1821,6 +1835,8 @@ if __name__ == '__main__':
     # Iterative Refinement
     parser.add_argument('--use-iterative-refinement', action='store_true', default=False,
                         help='Enable iterative refinement for joint angle mode')
+    parser.add_argument('--heatmap-only-train', action='store_true', default=False,
+                        help='Train only 2D heatmap branch (freeze 3D heads and disable 3D losses)')
     parser.add_argument('--refinement-iterations', type=int, default=3,
                         help='Number of refinement iterations')
     parser.add_argument('--refinement-weight', type=float, default=50.0,

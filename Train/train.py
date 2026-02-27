@@ -431,6 +431,8 @@ class Trainer:
         self.warmup_steps = max(0, int(config.get('warmup_steps', 0)))
         self.warmup_start_lr = float(config.get('warmup_start_lr', 1e-8))
         self.base_lrs = [group['lr'] for group in self.optimizer.param_groups]
+        self.freeze_2d_head_epochs = max(0, int(config.get('freeze_2d_head_epochs', 0)))
+        self._is_2d_head_frozen = False
 
         # Create output directory (only on main process)
         if self.is_main_process:
@@ -480,10 +482,54 @@ class Trainer:
         if self.warmup_steps > 0 and self.global_step < self.warmup_steps:
             self._apply_step_warmup_lr()
 
+        # Apply 2D head freeze state based on start epoch (supports resume)
+        if self.freeze_2d_head_epochs > 0:
+            should_freeze = self.start_epoch < self.freeze_2d_head_epochs
+            self._set_2d_head_trainable(trainable=not should_freeze)
+            self._is_2d_head_frozen = should_freeze
+            if self.is_main_process:
+                state = "frozen" if should_freeze else "trainable"
+                print(
+                    f"2D head freeze schedule: freeze for first {self.freeze_2d_head_epochs} epochs "
+                    f"(current start_epoch={self.start_epoch}, state={state})"
+                )
+
         # Save config (only on main process)
         if self.is_main_process:
             with open(self.output_dir / 'config.yaml', 'w') as f:
                 yaml.dump(config, f)
+
+    def _set_2d_head_trainable(self, trainable: bool) -> int:
+        """Set requires_grad for 2D heatmap head (keypoint_head)."""
+        model_ref = self.model.module if self.is_distributed else self.model
+        if not hasattr(model_ref, 'keypoint_head'):
+            return 0
+
+        num_params = 0
+        for p in model_ref.keypoint_head.parameters():
+            p.requires_grad = trainable
+            num_params += p.numel()
+        return num_params
+
+    def _update_2d_head_freeze_state(self, epoch: int):
+        """Freeze/unfreeze 2D head according to epoch schedule."""
+        if self.freeze_2d_head_epochs <= 0:
+            return
+
+        should_freeze = epoch < self.freeze_2d_head_epochs
+        if should_freeze == self._is_2d_head_frozen:
+            return
+
+        if should_freeze:
+            num_params = self._set_2d_head_trainable(trainable=False)
+            self._is_2d_head_frozen = True
+            if self.is_main_process:
+                print(f"Applied 2D head freeze at epoch {epoch} ({num_params:,} params)")
+        else:
+            num_params = self._set_2d_head_trainable(trainable=True)
+            self._is_2d_head_frozen = False
+            if self.is_main_process:
+                print(f"Released 2D head freeze at epoch {epoch} ({num_params:,} params trainable)")
 
     def _calculate_target_lr_at_epoch(self, epoch: int) -> float:
         """Calculate target LR at given epoch based on scheduler type"""
@@ -1081,6 +1127,7 @@ class Trainer:
 
         for epoch in range(self.start_epoch, num_epochs):
             epoch_start = time.time()
+            self._update_2d_head_freeze_state(epoch)
 
             # Print current LR at start of epoch
             current_lr = self.optimizer.param_groups[0]['lr']
@@ -1565,6 +1612,13 @@ def main(args):
 
     use_iter_refine = getattr(args, 'use_iterative_refinement', False)
     heatmap_only_train = getattr(args, 'heatmap_only_train', False)
+    freeze_2d_head_epochs = max(0, int(getattr(args, 'freeze_2d_head_epochs', 0)))
+    if freeze_2d_head_epochs > 0 and not args.load_2d_head and is_main_process:
+        print("Warning: --freeze-2d-head-epochs is set but --load-2d-head is empty. Freeze schedule will be ignored.")
+    if heatmap_only_train and freeze_2d_head_epochs > 0 and is_main_process:
+        print("Warning: --heatmap-only-train with --freeze-2d-head-epochs would freeze all trainable branches. Freeze schedule will be ignored.")
+    if not args.load_2d_head or heatmap_only_train:
+        freeze_2d_head_epochs = 0
     effective_use_iter_refine = use_iter_refine and not heatmap_only_train
 
     if is_main_process:
@@ -1573,6 +1627,7 @@ def main(args):
             f"Optimization config: optimizer={args.optimizer}, "
             f"scheduler={args.scheduler}, lr={args.learning_rate:.2e}, "
             f"warmup_steps={args.warmup_steps}, warmup_start_lr={args.warmup_start_lr:.2e}, "
+            f"freeze_2d_head_epochs={freeze_2d_head_epochs}, "
             f"heatmap_only={'yes' if heatmap_only_train else 'no'}, "
             f"resume={'yes' if args.resume else 'no'}"
         )
@@ -1714,6 +1769,7 @@ def main(args):
         'min_lr': args.min_lr,
         'warmup_steps': args.warmup_steps,
         'warmup_start_lr': args.warmup_start_lr,
+        'freeze_2d_head_epochs': freeze_2d_head_epochs,
         'weight_decay': args.weight_decay,
         'scheduler': args.scheduler,
         'heatmap_weight': args.heatmap_weight,
@@ -1855,6 +1911,8 @@ if __name__ == '__main__':
     # Load pretrained 2D heatmap head
     parser.add_argument('--load-2d-head', type=str, default=None,
                         help='Path to checkpoint to load pretrained 2D heatmap head weights from')
+    parser.add_argument('--freeze-2d-head-epochs', type=int, default=0,
+                        help='If >0 with --load-2d-head, freeze keypoint_head for first N epochs, then unfreeze')
 
     # Random seed
     parser.add_argument('--seed', type=int, default=42,

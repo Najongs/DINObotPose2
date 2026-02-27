@@ -132,7 +132,18 @@ def load_annotation(json_path, keypoint_names):
                             gt_3d[idx] = kp['location']
                         found[idx] = True
 
-    return image_path, gt_2d, gt_3d, camera_K, found
+    # SYN data 3D GT is in cm -> convert to meters
+    is_synthetic = 'syn' in json_path.lower()
+    if is_synthetic:
+        gt_3d = gt_3d / 100.0
+
+    # Extract GT joint angles from sim_state
+    gt_angles = None
+    if 'sim_state' in data and 'joints' in data['sim_state']:
+        joints = data['sim_state']['joints']
+        gt_angles = np.array([j['position'] for j in joints[:7]], dtype=np.float32)
+
+    return image_path, gt_2d, gt_3d, camera_K, found, gt_angles
 
 
 def compute_metrics(pred_2d, gt_2d, pred_3d, gt_3d, keypoint_names, found, orig_image_dim):
@@ -198,6 +209,8 @@ def network_inference(args):
     use_joint_embedding = False
     depth_only_3d = False
     joint_angle_3d = False
+    use_iterative_refinement = False
+    refinement_iterations = 3
     model_name = args.model_name
     image_size = 512
     heatmap_size = 512
@@ -208,16 +221,18 @@ def network_inference(args):
         use_joint_embedding = train_config.get('use_joint_embedding', False)
         depth_only_3d = train_config.get('depth_only_3d', False)
         joint_angle_3d = train_config.get('joint_angle_3d', False)
+        use_iterative_refinement = train_config.get('use_iterative_refinement', False)
+        refinement_iterations = int(train_config.get('refinement_iterations', 3))
         model_name = train_config.get('model_name', model_name)
         image_size = int(train_config.get('image_size', image_size))
         heatmap_size = int(train_config.get('heatmap_size', heatmap_size))
         if 'keypoint_names' in train_config:
             keypoint_names = train_config['keypoint_names']
-        print(f"# Config: use_joint_embedding={use_joint_embedding}, depth_only_3d={depth_only_3d}, joint_angle_3d={joint_angle_3d}")
+        print(f"# Config: use_joint_embedding={use_joint_embedding}, depth_only_3d={depth_only_3d}, joint_angle_3d={joint_angle_3d}, iterative_refinement={use_iterative_refinement}")
 
     # Load annotation JSON
     print(f"\n# Loading annotation: {args.json_path}")
-    image_path, gt_2d, gt_3d, camera_K, found = load_annotation(args.json_path, keypoint_names)
+    image_path, gt_2d, gt_3d, camera_K, found, gt_angles = load_annotation(args.json_path, keypoint_names)
 
     if image_path is None or not os.path.exists(image_path):
         print(f"# ERROR: Image not found at resolved path: {image_path}")
@@ -241,7 +256,9 @@ def network_inference(args):
         heatmap_size=(heatmap_size, heatmap_size),
         unfreeze_blocks=0,
         use_joint_embedding=use_joint_embedding,
-        mode_3d=mode_3d
+        mode_3d=mode_3d,
+        use_iterative_refinement=use_iterative_refinement,
+        refinement_iterations=refinement_iterations,
     ).to(device)
 
     # Load checkpoint
@@ -281,7 +298,10 @@ def network_inference(args):
         camera_K_tensor = torch.tensor(camera_K, dtype=torch.float32).unsqueeze(0).to(device)
 
     with torch.no_grad():
-        outputs = model(image_tensor, camera_K=camera_K_tensor, original_size=orig_dim)
+        outputs = model(
+            image_tensor, camera_K=camera_K_tensor, original_size=orig_dim,
+            use_refinement=use_iterative_refinement
+        )
         pred_heatmaps = outputs["heatmaps_2d"]
         pred_kpts_3d = outputs["keypoints_3d"]
 
@@ -356,10 +376,34 @@ def network_inference(args):
     if "joint_angles" in outputs and outputs["joint_angles"] is not None:
         pred_angles = outputs["joint_angles"][0].cpu().numpy()
         joint_names = ['joint1', 'joint2', 'joint3', 'joint4', 'joint5', 'joint6', 'joint7']
-        print(f"\n{'Joint':<12} {'Pred (rad)':<14} {'Pred (deg)':<14}")
-        print("-" * 40)
-        for j in range(min(len(joint_names), len(pred_angles))):
-            print(f"  {joint_names[j]:<10} {pred_angles[j]:10.4f}   {np.degrees(pred_angles[j]):10.2f}")
+        has_gt = gt_angles is not None
+        if has_gt:
+            print(f"\n{'Joint':<12} {'GT (rad)':<12} {'GT (deg)':<12} {'Pred (rad)':<12} {'Pred (deg)':<12} {'Err (deg)':<10}")
+            print("-" * 70)
+            angle_errors = []
+            for j in range(min(len(joint_names), len(pred_angles))):
+                gt_r = gt_angles[j] if j < len(gt_angles) else 0.0
+                err_deg = abs(np.degrees(pred_angles[j] - gt_r))
+                angle_errors.append(err_deg)
+                print(f"  {joint_names[j]:<10} {gt_r:9.4f}   {np.degrees(gt_r):9.2f}   {pred_angles[j]:9.4f}   {np.degrees(pred_angles[j]):9.2f}   {err_deg:8.2f}")
+            print(f"\n  Mean joint angle error: {np.mean(angle_errors):.2f} deg")
+            print(f"  Max joint angle error:  {np.max(angle_errors):.2f} deg")
+        else:
+            print(f"\n{'Joint':<12} {'Pred (rad)':<14} {'Pred (deg)':<14}")
+            print("-" * 40)
+            for j in range(min(len(joint_names), len(pred_angles))):
+                print(f"  {joint_names[j]:<10} {pred_angles[j]:10.4f}   {np.degrees(pred_angles[j]):10.2f}")
+            print("  (No GT joint angles available in this annotation)")
+
+    # Iterative refinement per-iteration angle error
+    if "all_refined_angles" in outputs and outputs["all_refined_angles"] is not None and gt_angles is not None:
+        all_ref_angles = outputs["all_refined_angles"]
+        print(f"\n  Iterative Refinement ({len(all_ref_angles)-1} iterations):")
+        for step_i, step_angles in enumerate(all_ref_angles):
+            step_a = step_angles[0].cpu().numpy()
+            step_errors = np.abs(np.degrees(step_a - gt_angles))
+            label = "initial" if step_i == 0 else f"iter {step_i}"
+            print(f"    [{label}] Mean angle error: {np.mean(step_errors):.2f} deg, Max: {np.max(step_errors):.2f} deg")
 
     print("=" * 80)
 

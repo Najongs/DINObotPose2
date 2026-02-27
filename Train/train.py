@@ -25,7 +25,8 @@ import wandb
 import cv2
 
 from model import (DINOv3PoseEstimator, MODE_DIRECT, MODE_DEPTH_ONLY,
-                    MODE_JOINT_ANGLE, panda_forward_kinematics)
+                    MODE_JOINT_ANGLE, panda_forward_kinematics,
+                    IterativeRefinementModule)
 from dataset import PoseEstimationDataset, create_dataloaders
 
 import sys
@@ -146,6 +147,7 @@ class UnifiedPoseLoss(nn.Module):
         loss_type: str = 'smoothl1',  # Loss function type: 'mse', 'l1', 'smoothl1'
         use_adaptive_weighting: bool = True,  # Use uncertainty-based adaptive weighting
         pnp_failure_penalty_weight: float = 0.1,  # PnP failure penalty weight
+        refinement_weight: float = 0.0,  # Iterative refinement loss weight
     ):
         super().__init__()
         self.heatmap_weight = heatmap_weight
@@ -157,6 +159,7 @@ class UnifiedPoseLoss(nn.Module):
         self.loss_type = loss_type
         self.use_adaptive_weighting = use_adaptive_weighting
         self.pnp_failure_penalty_weight = pnp_failure_penalty_weight
+        self.refinement_weight = refinement_weight
 
         # Heatmap loss: 항상 MSE 사용 (값 범위 0~1, Gaussian GT와 MSE가 자연스러움)
         self.heatmap_loss_fn = nn.MSELoss(reduction='none')
@@ -371,6 +374,47 @@ class UnifiedPoseLoss(nn.Module):
                     print(f"[Warning] Camera-frame 3D loss failed: {e}\n{traceback.format_exc()}")
                     pass
 
+        # Iterative refinement loss: penalize all intermediate steps with decaying weight
+        if self.refinement_weight > 0 and 'all_refined_angles' in pred_dict and 'angles' in gt_dict:
+            all_angles = pred_dict['all_refined_angles']  # list of (B, 7), length N+1
+            all_kp3d = pred_dict['all_refined_kp3d_robot']  # list of (B, 7, 3), length N+1
+            gt_angles = gt_dict['angles']  # (B, 7)
+            gt_kp_robot = panda_forward_kinematics(gt_angles)  # (B, 7, 3)
+            valid_mask_refine = pred_dict.get('refinement_valid_mask', None)  # (B,)
+
+            N = len(all_angles) - 1  # number of refinement iterations
+            decay = 0.5  # decay factor for earlier iterations
+            refine_loss = torch.tensor(0.0, device=total_loss.device)
+            refine_count = 0
+
+            # Skip index 0 (initial prediction, already covered by angle/fk_3d loss)
+            for step_i in range(1, len(all_angles)):
+                w = decay ** (N - step_i)  # later steps get higher weight
+
+                # Angle loss for this step
+                step_angle_loss = self.loss_fn(all_angles[step_i], gt_angles).mean()
+
+                # FK 3D loss for this step
+                step_fk_loss = self.loss_fn(all_kp3d[step_i], gt_kp_robot).mean()
+
+                step_loss = step_angle_loss + step_fk_loss
+
+                # Mask out invalid PnP samples if mask available
+                if valid_mask_refine is not None:
+                    # Only count loss if at least one valid sample
+                    n_valid = valid_mask_refine.float().sum()
+                    if n_valid > 0:
+                        refine_loss = refine_loss + w * step_loss
+                        refine_count += 1
+                else:
+                    refine_loss = refine_loss + w * step_loss
+                    refine_count += 1
+
+            if refine_count > 0:
+                refine_loss = refine_loss / refine_count
+                total_loss = total_loss + self.refinement_weight * refine_loss
+                loss_dict['refinement'] = refine_loss.item()
+
         # Update total in loss_dict
         loss_dict['total'] = total_loss.item()
 
@@ -568,9 +612,24 @@ class Trainer:
             # Joint angles for joint_angle mode
             gt_angles = batch['angles'].to(self.device) if 'angles' in batch else None
 
+            # Prepare GT 2D in original image coords for refinement module
+            gt_2d_image = None
+            if gt_keypoints_2d is not None and original_size is not None:
+                H_hm = self.config.get('heatmap_size', 512)
+                W_hm = H_hm
+                scale_x = original_size[:, 0:1] / W_hm  # (B, 1)
+                scale_y = original_size[:, 1:2] / H_hm  # (B, 1)
+                gt_2d_image = torch.stack([
+                    gt_keypoints_2d[:, :, 0] * scale_x,
+                    gt_keypoints_2d[:, :, 1] * scale_y,
+                ], dim=-1)  # (B, 7, 2) in original image coords
+
             # Forward pass
             orig_size_list = original_size[0].tolist() if original_size is not None else None
-            pred_dict = self.model(images, camera_K=camera_K, original_size=orig_size_list)
+            pred_dict = self.model(
+                images, camera_K=camera_K, original_size=orig_size_list,
+                gt_angles=gt_angles, gt_2d_image=gt_2d_image
+            )
 
             # Prepare ground truth dictionary
             gt_dict = {
@@ -615,6 +674,8 @@ class Trainer:
                     postfix['fk'] = f"{loss_dict['fk_3d']:.6f}"
                 if 'camera_3d' in loss_dict:
                     postfix['cam3d'] = f"{loss_dict['camera_3d']:.6f}"
+                if 'refinement' in loss_dict:
+                    postfix['ref'] = f"{loss_dict['refinement']:.6f}"
                 pbar.set_postfix(postfix)
 
                 # Log batch losses to wandb every N batches
@@ -634,6 +695,8 @@ class Trainer:
                             batch_log['batch/train_camera3d_loss'] = loss_dict['camera_3d']
                         if 'pnp_success_rate' in loss_dict:
                             batch_log['batch/pnp_success_rate'] = loss_dict['pnp_success_rate']
+                        if 'refinement' in loss_dict:
+                            batch_log['batch/train_refinement_loss'] = loss_dict['refinement']
                         wandb.log(batch_log, step=global_step)
                     except Exception:
                         pass  # Silently ignore batch logging errors
@@ -687,9 +750,24 @@ class Trainer:
             # Joint angles for joint_angle mode
             gt_angles = batch['angles'].to(self.device) if 'angles' in batch else None
 
+            # Prepare GT 2D in original image coords for refinement module
+            gt_2d_image = None
+            if gt_keypoints_2d is not None and original_size is not None:
+                H_hm = self.config.get('heatmap_size', 512)
+                W_hm = H_hm
+                scale_x = original_size[:, 0:1] / W_hm  # (B, 1)
+                scale_y = original_size[:, 1:2] / H_hm  # (B, 1)
+                gt_2d_image = torch.stack([
+                    gt_keypoints_2d[:, :, 0] * scale_x,
+                    gt_keypoints_2d[:, :, 1] * scale_y,
+                ], dim=-1)  # (B, 7, 2) in original image coords
+
             # Forward pass
             orig_size_list = original_size[0].tolist() if original_size is not None else None
-            pred_dict = self.model(images, camera_K=camera_K, original_size=orig_size_list)
+            pred_dict = self.model(
+                images, camera_K=camera_K, original_size=orig_size_list,
+                gt_angles=gt_angles, gt_2d_image=gt_2d_image
+            )
 
             # Prepare ground truth dictionary
             gt_dict = {
@@ -755,6 +833,8 @@ class Trainer:
                     postfix['fk'] = f"{loss_dict['fk_3d']:.6f}"
                 if 'camera_3d' in loss_dict:
                     postfix['cam3d'] = f"{loss_dict['camera_3d']:.6f}"
+                if 'refinement' in loss_dict:
+                    postfix['ref'] = f"{loss_dict['refinement']:.6f}"
                 pbar.set_postfix(postfix)
 
         # Average losses
@@ -883,6 +963,8 @@ class Trainer:
                         log_dict['train/fk3d_loss'] = train_losses['fk_3d']
                     if 'camera_3d' in train_losses:
                         log_dict['train/camera3d_loss'] = train_losses['camera_3d']
+                    if 'refinement' in train_losses:
+                        log_dict['train/refinement_loss'] = train_losses['refinement']
                     if 'pnp_success_rate' in train_losses:
                         log_dict['train/pnp_success_rate'] = train_losses['pnp_success_rate']
                     # Add all validation metrics
@@ -906,12 +988,16 @@ class Trainer:
                     train_extra += f", fk: {train_losses['fk_3d']:.6f}"
                 if 'camera_3d' in train_losses:
                     train_extra += f", cam3d: {train_losses['camera_3d']:.6f}"
+                if 'refinement' in train_losses:
+                    train_extra += f", ref: {train_losses['refinement']:.6f}"
                 if 'angle' in val_losses:
                     val_extra += f", ang: {val_losses['angle']:.6f}"
                 if 'fk_3d' in val_losses:
                     val_extra += f", fk: {val_losses['fk_3d']:.6f}"
                 if 'camera_3d' in val_losses:
                     val_extra += f", cam3d: {val_losses['camera_3d']:.6f}"
+                if 'refinement' in val_losses:
+                    val_extra += f", ref: {val_losses['refinement']:.6f}"
                 print(f"  Train Loss: {train_losses['total']:.6f} (hm: {train_losses['heatmap']:.6f}, kp3d: {train_losses['kp3d']:.6f}{train_extra})")
                 print(f"  Val Loss:   {val_losses['total']:.6f} (hm: {val_losses['heatmap']:.6f}, kp3d: {val_losses['kp3d']:.6f}{val_extra})")
                 if 'val_add_auc' in val_losses:
@@ -1327,12 +1413,17 @@ def main(args):
     if is_main_process:
         print(f"3D prediction mode: {mode_3d}")
 
+    use_iter_refine = getattr(args, 'use_iterative_refinement', False) and args.joint_angle_3d
+    refine_iters = getattr(args, 'refinement_iterations', 3)
+
     model = DINOv3PoseEstimator(
         dino_model_name=args.model_name,
         heatmap_size=(args.heatmap_size, args.heatmap_size),
         unfreeze_blocks=args.unfreeze_blocks,
         use_joint_embedding=args.use_joint_embedding,
-        mode_3d=mode_3d
+        mode_3d=mode_3d,
+        use_iterative_refinement=use_iter_refine,
+        refinement_iterations=refine_iters,
     ).to(device)
 
     # Wrap model with DistributedDataParallel for multi-GPU training
@@ -1341,7 +1432,7 @@ def main(args):
             model,
             device_ids=[local_rank],
             output_device=local_rank,
-            find_unused_parameters=False,
+            find_unused_parameters=use_iter_refine,  # refinement module may have unused params
             broadcast_buffers=True,
             gradient_as_bucket_view=True  # gradient stride 경고 완화
         )
@@ -1368,6 +1459,7 @@ def main(args):
     angle_w = args.angle_weight if args.joint_angle_3d else 0.0
     fk_3d_w = args.fk_3d_weight if args.joint_angle_3d else 0.0
     camera_3d_w = args.kp3d_weight if args.joint_angle_3d else 0.0  # Use kp3d_weight for camera-frame 3D loss in joint_angle mode
+    refinement_w = getattr(args, 'refinement_weight', 0.0) if use_iter_refine else 0.0
     criterion = UnifiedPoseLoss(
         heatmap_weight=args.heatmap_weight,
         kp3d_weight=args.kp3d_weight if not args.joint_angle_3d else 0.0,  # disable for non-joint_angle modes
@@ -1376,6 +1468,7 @@ def main(args):
         fk_3d_weight=fk_3d_w,
         camera_3d_weight=camera_3d_w,  # Camera-frame 3D loss (PnP-based transform)
         loss_type=args.loss_type,  # Loss function type: 'mse', 'l1', 'smoothl1'
+        refinement_weight=refinement_w,  # Iterative refinement loss weight
     ).to(device)
 
     # Optimizer
@@ -1461,6 +1554,9 @@ def main(args):
         'joint_angle_3d': args.joint_angle_3d,
         'angle_weight': angle_w,
         'fk_3d_weight': fk_3d_w,
+        'use_iterative_refinement': use_iter_refine,
+        'refinement_iterations': refine_iters,
+        'refinement_weight': refinement_w,
         'batch_size': args.batch_size,
         'epochs': args.epochs,
         'optimizer': args.optimizer,
@@ -1582,6 +1678,15 @@ if __name__ == '__main__':
                         help='Weight for joint angle MSE loss (joint_angle mode)')
     parser.add_argument('--fk-3d-weight', type=float, default=10.0,
                         help='Weight for FK 3D keypoint MSE loss (joint_angle mode)')
+
+    # Iterative Refinement
+    parser.add_argument('--use-iterative-refinement', action='store_true', default=False,
+                        help='Enable iterative refinement for joint angle mode')
+    parser.add_argument('--refinement-iterations', type=int, default=3,
+                        help='Number of refinement iterations')
+    parser.add_argument('--refinement-weight', type=float, default=50.0,
+                        help='Weight for iterative refinement loss')
+
     # Output
     parser.add_argument('--output-dir', type=str, default='./outputs',
                         help='Output directory for checkpoints and logs')

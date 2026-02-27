@@ -34,6 +34,11 @@ JOINT_ANGLE_3D=True  # Predict joint angles → FK → robot-frame 3D keypoints
 ANGLE_WEIGHT=10.0    # Joint angle MSE loss weight
 FK_3D_WEIGHT=100.0   # FK 3D keypoint MSE loss weight (robot frame)
 
+# Iterative Refinement (joint_angle mode only)
+USE_ITERATIVE_REFINEMENT=True  # Enable render-and-compare refinement loop
+REFINEMENT_ITERATIONS=3        # Number of refinement iterations
+REFINEMENT_WEIGHT=50.0         # Refinement loss weight
+
 # Loss weights
 HEATMAP_WEIGHT=1.0
 KP3D_WEIGHT=100.0
@@ -106,6 +111,13 @@ else
     JOINT_ANGLE_FLAG=""
 fi
 
+# Build iterative refinement flag
+if [ "${USE_ITERATIVE_REFINEMENT}" = "True" ] || [ "${USE_ITERATIVE_REFINEMENT}" = "true" ]; then
+    REFINEMENT_FLAG="--use-iterative-refinement --refinement-iterations ${REFINEMENT_ITERATIONS} --refinement-weight ${REFINEMENT_WEIGHT}"
+else
+    REFINEMENT_FLAG=""
+fi
+
 # Build base command
 BASE_CMD="python train.py \
     --data-dir ${DATA_DIR} \
@@ -117,6 +129,7 @@ BASE_CMD="python train.py \
     ${JOINT_EMBEDDING_FLAG} \
     ${DEPTH_ONLY_FLAG} \
     ${JOINT_ANGLE_FLAG} \
+    ${REFINEMENT_FLAG} \
     --epochs ${EPOCHS} \
     --batch-size ${BATCH_SIZE} \
     --num-workers ${NUM_WORKERS} \
@@ -191,6 +204,7 @@ elif [ "${TRAIN_MODE}" = "multi_gpu" ]; then
         ${JOINT_EMBEDDING_FLAG} \
         ${DEPTH_ONLY_FLAG} \
         ${JOINT_ANGLE_FLAG} \
+        ${REFINEMENT_FLAG} \
         --epochs ${EPOCHS} \
         --batch-size ${BATCH_SIZE} \
         --num-workers ${NUM_WORKERS} \

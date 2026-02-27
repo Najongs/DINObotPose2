@@ -10,10 +10,10 @@
 
 # Model checkpoint
 # MODEL_PATH="/home/najo/NAS/DIP/DINObotPose2/Train/outputs/dinov3_base_20260226_161726/best_model.pth"
-MODEL_PATH="/data/public/NAS/DINObotPose2/Train/outputs/dinov3_base_20260227_021707/best_model.pth"
+MODEL_PATH="/data/public/NAS/DINObotPose2/Train/outputs/dinov3_base_20260227_021707/epoch_21.pth"
 
 # Input annotation JSON (contains image_path + GT keypoints + camera K)
-JSON_PATH="/data/public/NAS/DINObotPose2/Dataset/Converted_dataset/DREAM_to_DREAM/panda-3cam_azure/000006.json"
+JSON_PATH="/data/public/NAS/DINObotPose2/Dataset/Converted_dataset/DREAM_to_DREAM/panda-3cam_azure/000000.json"
 # JSON_PATH="/home/najo/NAS/DIP/2025_ICRA_Multi_View_Robot_Pose_Estimation/dataset/Converted_dataset/DREAM_to_DREAM/panda-3cam_azure/000000.json"
 
 # Output directory

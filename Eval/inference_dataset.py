@@ -529,12 +529,17 @@ def run_inference(args):
     print(f"\nLoading model from {args.model_path}")
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
+    use_iterative_refinement = train_config.get('use_iterative_refinement', False)
+    refinement_iterations = int(train_config.get('refinement_iterations', 3))
+
     model = DINOv3PoseEstimator(
         dino_model_name=model_name,
         heatmap_size=(heatmap_size, heatmap_size),
         unfreeze_blocks=0,  # Not needed for inference
         use_joint_embedding=use_joint_embedding,
-        mode_3d=mode_3d
+        mode_3d=mode_3d,
+        use_iterative_refinement=use_iterative_refinement,
+        refinement_iterations=refinement_iterations,
     ).to(device)
 
     # Load checkpoint
@@ -585,7 +590,10 @@ def run_inference(args):
         # Forward pass (use per-sample camera_K and first sample's original_size)
         # Note: original_size is typically the same for all samples in a dataset
         orig_size = tuple(batch_original_size[0].astype(int).tolist())
-        outputs = model(images, camera_K=batch_camera_K, original_size=orig_size)
+        outputs = model(
+            images, camera_K=batch_camera_K, original_size=orig_size,
+            use_refinement=use_iterative_refinement
+        )
         pred_heatmaps = outputs["heatmaps_2d"]
         pred_kpts_3d = outputs["keypoints_3d"].cpu().numpy()  # (B, N_kp, 3)
 

@@ -4,6 +4,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers import AutoModel, SiglipVisionModel
 from torchvision.ops import roi_align
+import numpy as np
+import cv2
 
 FEATURE_DIM = 512
 NUM_JOINTS = 7  # DO NOT CHANGE: This value is intentionally set to 7.
@@ -664,13 +666,204 @@ class JointAngleHead(nn.Module):
         return joint_angles, keypoints_3d_robot
 
 
+def compute_extrinsics_from_pnp(kp3d_robot, kp2d_image, camera_K):
+    """
+    Batch PnP solver: compute robot-to-camera extrinsics [R, t].
+
+    Args:
+        kp3d_robot: (B, 7, 3) 3D keypoints in robot frame (detached numpy or tensor)
+        kp2d_image: (B, 7, 2) 2D keypoints in original image coords (detached numpy or tensor)
+        camera_K: (B, 3, 3) camera intrinsic matrices
+
+    Returns:
+        R_batch: (B, 3, 3) rotation matrices (detached tensors on same device as input)
+        t_batch: (B, 3) translation vectors (detached tensors)
+        valid_mask: (B,) bool tensor indicating which samples had successful PnP
+    """
+    if isinstance(kp3d_robot, torch.Tensor):
+        device = kp3d_robot.device
+        kp3d_np = kp3d_robot.detach().cpu().numpy()
+        kp2d_np = kp2d_image.detach().cpu().numpy()
+        K_np = camera_K.detach().cpu().numpy()
+    else:
+        device = torch.device('cpu')
+        kp3d_np = kp3d_robot
+        kp2d_np = kp2d_image
+        K_np = camera_K
+
+    B = kp3d_np.shape[0]
+    R_batch = torch.zeros(B, 3, 3, device=device)
+    t_batch = torch.zeros(B, 3, device=device)
+    valid_mask = torch.zeros(B, dtype=torch.bool, device=device)
+
+    for b in range(B):
+        try:
+            obj_pts = kp3d_np[b].astype(np.float64)
+            img_pts = kp2d_np[b].astype(np.float64)
+            K = K_np[b].astype(np.float64)
+
+            success, rvec, tvec = cv2.solvePnP(
+                obj_pts, img_pts, K, None, flags=cv2.SOLVEPNP_EPNP
+            )
+            if success:
+                R, _ = cv2.Rodrigues(rvec)
+                R_batch[b] = torch.from_numpy(R).float().to(device)
+                t_batch[b] = torch.from_numpy(tvec.flatten()).float().to(device)
+                valid_mask[b] = True
+        except Exception:
+            pass
+
+    return R_batch, t_batch, valid_mask
+
+
+class IterativeRefinementModule(nn.Module):
+    """
+    Iterative refinement for joint angle prediction via render-and-compare.
+
+    Pipeline per iteration:
+        FK(θᵢ) → kp3d_robot → project(R,t,K) → pred_2d
+        Δuv = target_2d - pred_2d
+        CorrectionNet(Δuv, θᵢ, |Δuv|) → Δθ
+        θᵢ₊₁ = clamp(θᵢ + step_scale * Δθ)
+
+    R, t are obtained via PnP (detached, no gradient).
+    """
+
+    def __init__(self, num_iterations=3, num_angles=7):
+        super().__init__()
+        self.num_iterations = num_iterations
+        self.num_angles = num_angles
+
+        # Joint limits as buffers (same as JointAngleHead)
+        limits = torch.tensor(_PANDA_JOINT_LIMITS, dtype=torch.float32)
+        self.register_buffer('joint_lower', limits[:, 0])
+        self.register_buffer('joint_upper', limits[:, 1])
+
+        # Shared correction network (weight-tied across iterations)
+        # Input: Δuv (7*2=14) + θ_current (7) + |Δuv| (7) = 28
+        self.correction_net = nn.Sequential(
+            nn.Linear(28, 128),
+            nn.GELU(),
+            nn.LayerNorm(128),
+            nn.Linear(128, 128),
+            nn.GELU(),
+            nn.LayerNorm(128),
+            nn.Linear(128, num_angles),
+        )
+
+        # Learnable step scale per iteration (sigmoid-gated, init ~0.1)
+        # logit for sigmoid(x)=0.1 is ln(0.1/0.9) ≈ -2.2
+        self.step_scale_logits = nn.Parameter(
+            torch.full((num_iterations,), -2.2)
+        )
+
+    def _project_to_2d(self, kp3d_robot, R, t, K):
+        """
+        Differentiable projection: robot frame → camera frame → 2D image coords.
+
+        Args:
+            kp3d_robot: (B, 7, 3) robot-frame keypoints (differentiable)
+            R: (B, 3, 3) rotation matrices (detached)
+            t: (B, 3) translation vectors (detached)
+            K: (B, 3, 3) camera intrinsics (detached)
+
+        Returns:
+            uv: (B, 7, 2) projected 2D coordinates in original image space
+        """
+        # Transform to camera frame: kp_cam = R @ kp_robot^T + t
+        # (B, 3, 3) @ (B, 3, 7) → (B, 3, 7)
+        kp_cam = torch.bmm(R, kp3d_robot.transpose(1, 2)) + t.unsqueeze(-1)
+        kp_cam = kp_cam.transpose(1, 2)  # (B, 7, 3)
+
+        # Project: uv = K @ kp_cam / z
+        z = kp_cam[:, :, 2:3].clamp(min=1e-6)  # (B, 7, 1)
+        kp_norm = kp_cam / z  # (B, 7, 3) - [x/z, y/z, 1]
+
+        # Apply intrinsics: (B, 3, 3) @ (B, 3, 7) → (B, 3, 7)
+        uv_h = torch.bmm(K, kp_norm.transpose(1, 2)).transpose(1, 2)  # (B, 7, 3)
+        uv = uv_h[:, :, :2]  # (B, 7, 2)
+
+        return uv
+
+    def forward(self, initial_angles, target_2d, camera_K, original_size,
+                R_ext, t_ext, valid_mask):
+        """
+        Run iterative refinement loop.
+
+        Args:
+            initial_angles: (B, 7) initial joint angle predictions from JointAngleHead
+            target_2d: (B, 7, 2) target 2D keypoints in original image coords
+                       (from heatmap hard-argmax during inference, or GT during training)
+            camera_K: (B, 3, 3) camera intrinsic matrices
+            original_size: (W, H) tuple of original image size
+            R_ext: (B, 3, 3) rotation matrices from PnP (detached)
+            t_ext: (B, 3) translation vectors from PnP (detached)
+            valid_mask: (B,) bool mask for valid PnP samples
+
+        Returns:
+            dict with:
+                'refined_angles': (B, 7) final refined angles
+                'refined_kp3d_robot': (B, 7, 3) FK keypoints from refined angles
+                'all_angles': list of (B, 7) angles at each iteration
+                'all_kp3d_robot': list of (B, 7, 3) FK keypoints at each iteration
+        """
+        B = initial_angles.shape[0]
+        theta = initial_angles  # (B, 7) - gradients flow through this
+
+        all_angles = [theta]
+        all_kp3d_robot = [panda_forward_kinematics(theta)]
+
+        for i in range(self.num_iterations):
+            # FK to get current 3D keypoints in robot frame
+            kp3d_robot = panda_forward_kinematics(theta)  # (B, 7, 3)
+
+            # Project to 2D (differentiable through FK and projection, R/t detached)
+            pred_2d = self._project_to_2d(kp3d_robot, R_ext, t_ext, camera_K)  # (B, 7, 2)
+
+            # Compute reprojection error
+            delta_uv = target_2d - pred_2d  # (B, 7, 2)
+
+            # For invalid PnP samples, zero out delta to avoid garbage gradients
+            delta_uv = delta_uv * valid_mask.float().unsqueeze(-1).unsqueeze(-1)
+
+            # Prepare correction net input
+            delta_uv_flat = delta_uv.reshape(B, -1)  # (B, 14)
+            delta_uv_mag = delta_uv.norm(dim=-1)  # (B, 7)
+            correction_input = torch.cat([delta_uv_flat, theta, delta_uv_mag], dim=-1)  # (B, 28)
+
+            # Predict angle correction
+            delta_theta = self.correction_net(correction_input)  # (B, 7)
+
+            # Apply step scale (sigmoid-gated)
+            step_scale = torch.sigmoid(self.step_scale_logits[i])
+
+            # Update angles with clamping to joint limits
+            theta = torch.clamp(
+                theta + step_scale * delta_theta,
+                min=self.joint_lower.unsqueeze(0),
+                max=self.joint_upper.unsqueeze(0)
+            )
+
+            all_angles.append(theta)
+            all_kp3d_robot.append(panda_forward_kinematics(theta))
+
+        return {
+            'refined_angles': theta,
+            'refined_kp3d_robot': all_kp3d_robot[-1],
+            'all_angles': all_angles,
+            'all_kp3d_robot': all_kp3d_robot,
+        }
+
+
 class DINOv3PoseEstimator(nn.Module):
     def __init__(self, dino_model_name, heatmap_size, unfreeze_blocks=2,
-                 use_joint_embedding=False, mode_3d=MODE_DIRECT):
+                 use_joint_embedding=False, mode_3d=MODE_DIRECT,
+                 use_iterative_refinement=False, refinement_iterations=3):
         super().__init__()
         self.dino_model_name = dino_model_name
         self.heatmap_size = heatmap_size  # (H, W) tuple
         self.mode_3d = mode_3d
+        self.use_iterative_refinement = use_iterative_refinement
         self.backbone = DINOv3Backbone(dino_model_name, unfreeze_blocks=unfreeze_blocks)
 
         if "siglip" in self.dino_model_name:
@@ -694,6 +887,15 @@ class DINOv3PoseEstimator(nn.Module):
                 num_angles=7
             )
             self.keypoint_3d_head = None
+
+            # 3. Iterative Refinement Module (joint_angle mode only)
+            if use_iterative_refinement:
+                self.refinement_module = IterativeRefinementModule(
+                    num_iterations=refinement_iterations,
+                    num_angles=7
+                )
+            else:
+                self.refinement_module = None
         else:
             self.keypoint_3d_head = Keypoint3DHead(
                 input_dim=feature_dim,
@@ -702,13 +904,18 @@ class DINOv3PoseEstimator(nn.Module):
                 mode=mode_3d
             )
             self.joint_angle_head = None
+            self.refinement_module = None
 
-    def forward(self, image_tensor_batch, camera_K=None, original_size=None):
+    def forward(self, image_tensor_batch, camera_K=None, original_size=None,
+                gt_angles=None, gt_2d_image=None, use_refinement=None):
         """
         Args:
             image_tensor_batch: (B, 3, H, W) input images
             camera_K: (B, 3, 3) camera intrinsics (required for depth_only mode)
             original_size: (W, H) original image resolution (required for depth_only mode)
+            gt_angles: (B, 7) GT joint angles (for training refinement with stable PnP)
+            gt_2d_image: (B, 7, 2) GT 2D keypoints in original image coords (for training refinement)
+            use_refinement: bool override (None = use self.use_iterative_refinement)
         """
         # 1. Extract visual representations
         dino_features = self.backbone(image_tensor_batch)
@@ -721,12 +928,88 @@ class DINOv3PoseEstimator(nn.Module):
             joint_angles, kpts_3d_robot = self.joint_angle_head(
                 dino_features, predicted_heatmaps
             )
-            return {
+            result = {
                 'heatmaps_2d': predicted_heatmaps,
                 'keypoints_3d': kpts_3d_robot,  # robot base frame
                 'joint_angles': joint_angles,
                 'keypoints_3d_robot': kpts_3d_robot,
             }
+
+            # 4. Iterative Refinement (if enabled)
+            do_refine = use_refinement if use_refinement is not None else self.use_iterative_refinement
+            if do_refine and self.refinement_module is not None and camera_K is not None:
+                B = image_tensor_batch.shape[0]
+                hm_h, hm_w = predicted_heatmaps.shape[2], predicted_heatmaps.shape[3]
+
+                # Get 2D target for refinement
+                if gt_2d_image is not None:
+                    # Training: use GT 2D keypoints (more stable)
+                    target_2d = gt_2d_image  # already in original image coords
+                else:
+                    # Inference: use heatmap hard-argmax → scale to original image coords
+                    heatmaps_flat = predicted_heatmaps.detach().reshape(B, NUM_JOINTS, -1)
+                    max_indices = torch.argmax(heatmaps_flat, dim=-1)
+                    x = (max_indices % hm_w).float()
+                    y = (max_indices // hm_w).float()
+                    target_2d_hm = torch.stack([x, y], dim=-1)  # (B, 7, 2) in heatmap coords
+
+                    # Scale to original image coords
+                    if original_size is not None:
+                        if isinstance(original_size, (list, tuple)):
+                            orig_w, orig_h = original_size[0], original_size[1]
+                        else:
+                            orig_w = original_size[:, 0:1].unsqueeze(-1)  # (B, 1, 1)
+                            orig_h = original_size[:, 1:2].unsqueeze(-1)
+                        scale_x = orig_w / hm_w
+                        scale_y = orig_h / hm_h
+                        target_2d = torch.stack([
+                            target_2d_hm[:, :, 0] * scale_x if isinstance(scale_x, float) else target_2d_hm[:, :, 0] * scale_x.squeeze(-1),
+                            target_2d_hm[:, :, 1] * scale_y if isinstance(scale_y, float) else target_2d_hm[:, :, 1] * scale_y.squeeze(-1),
+                        ], dim=-1)
+                    else:
+                        target_2d = target_2d_hm
+
+                # Compute extrinsics via PnP
+                if gt_angles is not None:
+                    # Training: use GT angles for stable PnP
+                    with torch.no_grad():
+                        gt_kp3d_robot = panda_forward_kinematics(gt_angles)
+                    R_ext, t_ext, valid_mask = compute_extrinsics_from_pnp(
+                        gt_kp3d_robot, target_2d, camera_K
+                    )
+                else:
+                    # Inference: use predicted angles
+                    R_ext, t_ext, valid_mask = compute_extrinsics_from_pnp(
+                        kpts_3d_robot.detach(), target_2d.detach(), camera_K
+                    )
+
+                # Detach R, t to prevent gradient flow through PnP
+                R_ext = R_ext.detach()
+                t_ext = t_ext.detach()
+
+                # Run refinement
+                refine_out = self.refinement_module(
+                    initial_angles=joint_angles,
+                    target_2d=target_2d,
+                    camera_K=camera_K,
+                    original_size=original_size,
+                    R_ext=R_ext,
+                    t_ext=t_ext,
+                    valid_mask=valid_mask,
+                )
+
+                result['refined_angles'] = refine_out['refined_angles']
+                result['refined_kp3d_robot'] = refine_out['refined_kp3d_robot']
+                result['all_refined_angles'] = refine_out['all_angles']
+                result['all_refined_kp3d_robot'] = refine_out['all_kp3d_robot']
+                result['refinement_valid_mask'] = valid_mask
+
+                # Update main outputs to use refined results
+                result['joint_angles'] = refine_out['refined_angles']
+                result['keypoints_3d'] = refine_out['refined_kp3d_robot']
+                result['keypoints_3d_robot'] = refine_out['refined_kp3d_robot']
+
+            return result
         else:
             predicted_kpts_3d = self.keypoint_3d_head(
                 dino_features, predicted_heatmaps,

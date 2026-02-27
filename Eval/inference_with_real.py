@@ -24,7 +24,7 @@ import dream
 
 # Import model from Train directory
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../Train')))
-from model import DINOv3PoseEstimator, MODE_DIRECT, MODE_DEPTH_ONLY, MODE_JOINT_ANGLE
+from model import DINOv3PoseEstimator
 
 
 def get_keypoints_from_heatmaps(heatmaps_tensor):
@@ -207,8 +207,6 @@ def network_inference(args):
     config_path = checkpoint_dir / 'config.yaml'
 
     use_joint_embedding = False
-    depth_only_3d = False
-    joint_angle_3d = False
     use_iterative_refinement = False
     refinement_iterations = 3
     model_name = args.model_name
@@ -219,8 +217,6 @@ def network_inference(args):
         with open(config_path, 'r') as f:
             train_config = yaml.safe_load(f)
         use_joint_embedding = train_config.get('use_joint_embedding', False)
-        depth_only_3d = train_config.get('depth_only_3d', False)
-        joint_angle_3d = train_config.get('joint_angle_3d', False)
         use_iterative_refinement = train_config.get('use_iterative_refinement', False)
         refinement_iterations = int(train_config.get('refinement_iterations', 3))
         model_name = train_config.get('model_name', model_name)
@@ -228,7 +224,7 @@ def network_inference(args):
         heatmap_size = int(train_config.get('heatmap_size', heatmap_size))
         if 'keypoint_names' in train_config:
             keypoint_names = train_config['keypoint_names']
-        print(f"# Config: use_joint_embedding={use_joint_embedding}, depth_only_3d={depth_only_3d}, joint_angle_3d={joint_angle_3d}, iterative_refinement={use_iterative_refinement}")
+        print(f"# Config: use_joint_embedding={use_joint_embedding}, iterative_refinement={use_iterative_refinement}")
 
     # Load annotation JSON
     print(f"\n# Loading annotation: {args.json_path}")
@@ -244,19 +240,12 @@ def network_inference(args):
     if camera_K is not None:
         print(f"# Camera K:\n{camera_K}")
 
-    # Create model with correct mode
-    if joint_angle_3d:
-        mode_3d = MODE_JOINT_ANGLE
-    elif depth_only_3d:
-        mode_3d = MODE_DEPTH_ONLY
-    else:
-        mode_3d = MODE_DIRECT
+    # Create model
     model = DINOv3PoseEstimator(
         dino_model_name=model_name,
         heatmap_size=(heatmap_size, heatmap_size),
         unfreeze_blocks=0,
         use_joint_embedding=use_joint_embedding,
-        mode_3d=mode_3d,
         use_iterative_refinement=use_iterative_refinement,
         refinement_iterations=refinement_iterations,
     ).to(device)
@@ -316,21 +305,17 @@ def network_inference(args):
     # 3D predictions - handle different modes
     pred_3d_raw = pred_kpts_3d[0].cpu().numpy()
 
-    # If MODE_JOINT_ANGLE, transform from robot frame to camera frame
-    if mode_3d == MODE_JOINT_ANGLE:
-        if camera_K is not None:
-            print("# Transforming robot frame → camera frame using PnP...")
-            pred_3d = transform_robot_to_camera(pred_3d_raw, pred_2d_orig, camera_K)
-            if pred_3d is None:
-                print("# Warning: PnP failed, using robot frame coordinates (comparison with GT will be invalid)")
-                pred_3d = pred_3d_raw
-            else:
-                print("# Successfully transformed to camera frame")
-        else:
-            print("# Warning: No camera K available, using robot frame coordinates (comparison with GT will be invalid)")
+    # Transform from robot frame to camera frame using PnP
+    if camera_K is not None:
+        print("# Transforming robot frame → camera frame using PnP...")
+        pred_3d = transform_robot_to_camera(pred_3d_raw, pred_2d_orig, camera_K)
+        if pred_3d is None:
+            print("# Warning: PnP failed, using robot frame coordinates (comparison with GT will be invalid)")
             pred_3d = pred_3d_raw
+        else:
+            print("# Successfully transformed to camera frame")
     else:
-        # MODE_DIRECT or MODE_DEPTH_ONLY already output camera frame coordinates
+        print("# Warning: No camera K available, using robot frame coordinates (comparison with GT will be invalid)")
         pred_3d = pred_3d_raw
 
     # === Compute Metrics ===

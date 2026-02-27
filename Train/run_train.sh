@@ -24,8 +24,6 @@ HEATMAP_SIZE=512
 UNFREEZE_BLOCKS=2  # Number of backbone blocks to unfreeze for fine-tuning
 
 USE_JOINT_EMBEDDING=True  # Enable joint identity embeddings in 3D head
-DEPTH_ONLY_3D=False  # Predict only depth (z), recover x,y from 2D heatmap + camera K
-JOINT_ANGLE_3D=True  # Predict joint angles → FK → robot-frame 3D keypoints
 
 # Joint angle mode loss weights
 # angle loss: 라디안 단위 (범위 ~0~6), 3D loss: 미터 단위 (범위 ~0.01~0.5)
@@ -69,8 +67,8 @@ WANDB_RUN_NAME="dinov3_base_$(date +%Y%m%d_%H%M%S)"
 
 # Other settings
 SEED=42
-RESUME=""  # Path to checkpoint for resuming (leave empty for new training)
-LOAD_2D_HEAD="/data/public/NAS/DINObotPose2/Train/outputs/dinov3_base_20260227_005854/epoch_3.pth"  # Path to checkpoint for loading pretrained 2D heatmap head (leave empty to train from scratch)
+RESUME="/data/public/NAS/DINObotPose2/Train/outputs/dinov3_base_20260227_021707/epoch_21.pth"  # Path to checkpoint for resuming (leave empty for new training)
+LOAD_2D_HEAD=""  # Path to checkpoint for loading pretrained 2D heatmap head (leave empty to train from scratch)
 
 # =============================================================================
 # Training Modes
@@ -97,20 +95,6 @@ else
     JOINT_EMBEDDING_FLAG=""
 fi
 
-# Build depth-only 3D flag
-if [ "${DEPTH_ONLY_3D}" = "True" ] || [ "${DEPTH_ONLY_3D}" = "true" ]; then
-    DEPTH_ONLY_FLAG="--depth-only-3d"
-else
-    DEPTH_ONLY_FLAG=""
-fi
-
-# Build joint angle 3D flag
-if [ "${JOINT_ANGLE_3D}" = "True" ] || [ "${JOINT_ANGLE_3D}" = "true" ]; then
-    JOINT_ANGLE_FLAG="--joint-angle-3d --angle-weight ${ANGLE_WEIGHT} --fk-3d-weight ${FK_3D_WEIGHT}"
-else
-    JOINT_ANGLE_FLAG=""
-fi
-
 # Build iterative refinement flag
 if [ "${USE_ITERATIVE_REFINEMENT}" = "True" ] || [ "${USE_ITERATIVE_REFINEMENT}" = "true" ]; then
     REFINEMENT_FLAG="--use-iterative-refinement --refinement-iterations ${REFINEMENT_ITERATIONS} --refinement-weight ${REFINEMENT_WEIGHT}"
@@ -127,8 +111,8 @@ BASE_CMD="python train.py \
     --heatmap-size ${HEATMAP_SIZE} \
     --unfreeze-blocks ${UNFREEZE_BLOCKS} \
     ${JOINT_EMBEDDING_FLAG} \
-    ${DEPTH_ONLY_FLAG} \
-    ${JOINT_ANGLE_FLAG} \
+    --angle-weight ${ANGLE_WEIGHT} \
+    --fk-3d-weight ${FK_3D_WEIGHT} \
     ${REFINEMENT_FLAG} \
     --epochs ${EPOCHS} \
     --batch-size ${BATCH_SIZE} \
@@ -202,8 +186,8 @@ elif [ "${TRAIN_MODE}" = "multi_gpu" ]; then
         --heatmap-size ${HEATMAP_SIZE} \
         --unfreeze-blocks ${UNFREEZE_BLOCKS} \
         ${JOINT_EMBEDDING_FLAG} \
-        ${DEPTH_ONLY_FLAG} \
-        ${JOINT_ANGLE_FLAG} \
+        --angle-weight ${ANGLE_WEIGHT} \
+        --fk-3d-weight ${FK_3D_WEIGHT} \
         ${REFINEMENT_FLAG} \
         --epochs ${EPOCHS} \
         --batch-size ${BATCH_SIZE} \

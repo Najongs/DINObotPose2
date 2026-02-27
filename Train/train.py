@@ -24,8 +24,7 @@ import yaml
 import wandb
 import cv2
 
-from model import (DINOv3PoseEstimator, MODE_DIRECT, MODE_DEPTH_ONLY,
-                    MODE_JOINT_ANGLE, panda_forward_kinematics,
+from model import (DINOv3PoseEstimator, panda_forward_kinematics,
                     IterativeRefinementModule)
 from dataset import PoseEstimationDataset, create_dataloaders
 
@@ -517,7 +516,21 @@ class Trainer:
             # Remove 'module.' prefix if loading DDP checkpoint into non-DDP model
             state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
 
-        self.model.load_state_dict(state_dict)
+        # Load model state with strict=False to allow partial loading (missing keys will be randomly initialized)
+        missing_keys, unexpected_keys = self.model.load_state_dict(state_dict, strict=False)
+
+        if self.is_main_process:
+            if missing_keys:
+                print(f"⚠️  Missing keys in checkpoint (will be randomly initialized):")
+                for key in missing_keys:
+                    print(f"   - {key}")
+            if unexpected_keys:
+                print(f"⚠️  Unexpected keys in checkpoint (ignored):")
+                for key in unexpected_keys:
+                    print(f"   - {key}")
+            if not missing_keys and not unexpected_keys:
+                print("✓ All model parameters loaded successfully")
+
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
 
         if self.scheduler and 'scheduler_state_dict' in checkpoint:
@@ -1404,16 +1417,10 @@ def main(args):
             if is_main_process:
                 print(f"Warning: Failed to load camera settings: {e}")
 
-    if args.joint_angle_3d:
-        mode_3d = MODE_JOINT_ANGLE
-    elif args.depth_only_3d:
-        mode_3d = MODE_DEPTH_ONLY
-    else:
-        mode_3d = MODE_DIRECT
     if is_main_process:
-        print(f"3D prediction mode: {mode_3d}")
+        print(f"3D prediction mode: joint_angle")
 
-    use_iter_refine = getattr(args, 'use_iterative_refinement', False) and args.joint_angle_3d
+    use_iter_refine = getattr(args, 'use_iterative_refinement', False)
     refine_iters = getattr(args, 'refinement_iterations', 3)
 
     model = DINOv3PoseEstimator(
@@ -1421,7 +1428,6 @@ def main(args):
         heatmap_size=(args.heatmap_size, args.heatmap_size),
         unfreeze_blocks=args.unfreeze_blocks,
         use_joint_embedding=args.use_joint_embedding,
-        mode_3d=mode_3d,
         use_iterative_refinement=use_iter_refine,
         refinement_iterations=refine_iters,
     ).to(device)
@@ -1456,13 +1462,13 @@ def main(args):
         )
 
     # Loss function
-    angle_w = args.angle_weight if args.joint_angle_3d else 0.0
-    fk_3d_w = args.fk_3d_weight if args.joint_angle_3d else 0.0
-    camera_3d_w = args.kp3d_weight if args.joint_angle_3d else 0.0  # Use kp3d_weight for camera-frame 3D loss in joint_angle mode
+    angle_w = args.angle_weight
+    fk_3d_w = args.fk_3d_weight
+    camera_3d_w = args.kp3d_weight  # Camera-frame 3D loss (PnP-based transform)
     refinement_w = getattr(args, 'refinement_weight', 0.0) if use_iter_refine else 0.0
     criterion = UnifiedPoseLoss(
         heatmap_weight=args.heatmap_weight,
-        kp3d_weight=args.kp3d_weight if not args.joint_angle_3d else 0.0,  # disable for non-joint_angle modes
+        kp3d_weight=0.0,  # Not used in joint_angle mode (use angle/FK/camera_3d losses instead)
         heatmap_size=args.heatmap_size,
         angle_weight=angle_w,
         fk_3d_weight=fk_3d_w,
@@ -1550,8 +1556,7 @@ def main(args):
         'heatmap_size': args.heatmap_size,
         'unfreeze_blocks': args.unfreeze_blocks,
         'use_joint_embedding': args.use_joint_embedding,
-        'depth_only_3d': args.depth_only_3d,
-        'joint_angle_3d': args.joint_angle_3d,
+        'joint_angle_3d': True,
         'angle_weight': angle_w,
         'fk_3d_weight': fk_3d_w,
         'use_iterative_refinement': use_iter_refine,
@@ -1633,10 +1638,6 @@ if __name__ == '__main__':
                         help='Number of backbone blocks to unfreeze')
     parser.add_argument('--use-joint-embedding', action='store_true', default=False,
                         help='Enable joint identity embeddings in 3D head for kinematic constraint learning')
-    parser.add_argument('--depth-only-3d', action='store_true', default=False,
-                        help='Predict only depth (z), recover x,y from 2D heatmap + camera K')
-    parser.add_argument('--joint-angle-3d', action='store_true', default=False,
-                        help='Predict joint angles → FK → robot-frame 3D keypoints')
 
     # Training
     parser.add_argument('--epochs', type=int, default=100,

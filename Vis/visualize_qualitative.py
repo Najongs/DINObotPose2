@@ -20,7 +20,7 @@ import yaml
 from PIL import Image as PILImage
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../Train')))
-from model import DINOv3PoseEstimator, MODE_DIRECT, MODE_DEPTH_ONLY
+from model import DINOv3PoseEstimator
 
 
 # ─── Constants ───────────────────────────────────────────────────────────────
@@ -247,7 +247,8 @@ def load_model(model_path, device):
 
     model_name = 'facebook/dinov3-vitb16-pretrain-lvd1689m'
     use_joint_embedding = False
-    depth_only_3d = False
+    use_iterative_refinement = False
+    refinement_iterations = 3
     image_size = 512
     heatmap_size = 512
 
@@ -256,17 +257,18 @@ def load_model(model_path, device):
             cfg = yaml.safe_load(f)
         model_name = cfg.get('model_name', model_name)
         use_joint_embedding = cfg.get('use_joint_embedding', False)
-        depth_only_3d = cfg.get('depth_only_3d', False)
+        use_iterative_refinement = cfg.get('use_iterative_refinement', False)
+        refinement_iterations = int(cfg.get('refinement_iterations', 3))
         image_size = int(cfg.get('image_size', image_size))
         heatmap_size = int(cfg.get('heatmap_size', heatmap_size))
 
-    mode_3d = MODE_DEPTH_ONLY if depth_only_3d else MODE_DIRECT
     model = DINOv3PoseEstimator(
         dino_model_name=model_name,
         heatmap_size=(heatmap_size, heatmap_size),
         unfreeze_blocks=0,
         use_joint_embedding=use_joint_embedding,
-        mode_3d=mode_3d
+        use_iterative_refinement=use_iterative_refinement,
+        refinement_iterations=refinement_iterations,
     ).to(device)
 
     checkpoint = torch.load(model_path, map_location=device, weights_only=False)

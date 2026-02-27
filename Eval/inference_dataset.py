@@ -29,7 +29,7 @@ from dream import analysis as dream_analysis
 
 # Import model from TRAIN directory
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../Train')))
-from model import DINOv3PoseEstimator, MODE_DIRECT, MODE_DEPTH_ONLY, MODE_JOINT_ANGLE
+from model import DINOv3PoseEstimator
 
 
 class InferenceDataset(Dataset):
@@ -494,21 +494,10 @@ def run_inference(args):
     image_size = args.image_size or int(train_config.get('image_size', 512))
     heatmap_size = args.heatmap_size or int(train_config.get('heatmap_size', 512))
     use_joint_embedding = train_config.get('use_joint_embedding', False)
-    depth_only_3d = train_config.get('depth_only_3d', False)
-    joint_angle_3d = train_config.get('joint_angle_3d', False)
-
-    # Determine 3D prediction mode
-    if joint_angle_3d:
-        mode_3d = MODE_JOINT_ANGLE
-    elif depth_only_3d:
-        mode_3d = MODE_DEPTH_ONLY
-    else:
-        mode_3d = MODE_DIRECT
-
     print(f"  model_name: {model_name}")
     print(f"  image_size: {image_size}, heatmap_size: {heatmap_size}")
     print(f"  use_joint_embedding: {use_joint_embedding}")
-    print(f"  depth_only_3d: {depth_only_3d}, joint_angle_3d: {joint_angle_3d} (mode: {mode_3d})")
+    print(f"  mode: joint_angle")
 
     # Create dataset
     dataset = InferenceDataset(
@@ -537,7 +526,6 @@ def run_inference(args):
         heatmap_size=(heatmap_size, heatmap_size),
         unfreeze_blocks=0,  # Not needed for inference
         use_joint_embedding=use_joint_embedding,
-        mode_3d=mode_3d,
         use_iterative_refinement=use_iterative_refinement,
         refinement_iterations=refinement_iterations,
     ).to(device)
@@ -618,9 +606,9 @@ def run_inference(args):
             pred_kp_scaled[:, 0] *= scale_x
             pred_kp_scaled[:, 1] *= scale_y
 
-            # Transform 3D predictions from robot frame to camera frame if MODE_JOINT_ANGLE
+            # Transform 3D predictions from robot frame to camera frame via PnP
             pred_3d_sample = pred_kpts_3d[i]
-            if mode_3d == MODE_JOINT_ANGLE and sample_camera_K is not None:
+            if sample_camera_K is not None:
                 pred_3d_camera = transform_robot_to_camera(pred_3d_sample, pred_kp_scaled, sample_camera_K)
                 if pred_3d_camera is not None:
                     pred_3d_sample = pred_3d_camera
@@ -724,9 +712,7 @@ def run_inference(args):
 
     print(f"\nDataset: {args.dataset_dir}")
     print(f"Model: {args.model_path}")
-    print(f"3D Prediction Mode: {mode_3d}")
-    if mode_3d == MODE_JOINT_ANGLE:
-        print("  (Robot frame → Camera frame via PnP transformation)")
+    print(f"3D Prediction Mode: joint_angle (Robot frame → Camera frame via PnP)")
     print(f"Number of frames: {n_samples}")
 
     # 2D Keypoint metrics
@@ -767,7 +753,7 @@ def run_inference(args):
 
     # Joint angle metrics (if joint_angle mode)
     joint_angle_metrics = {}
-    if all_joint_angles_pred is not None and mode_3d == MODE_JOINT_ANGLE:
+    if all_joint_angles_pred is not None:
         # Compare predicted vs GT joint angles (7 active joints: indices 0-6)
         gt_angles_7 = all_joint_angles_gt[:, :7]  # (N, 7) first 7 joints
         pred_angles_7 = all_joint_angles_pred[:, :7] if all_joint_angles_pred.shape[1] >= 7 else all_joint_angles_pred

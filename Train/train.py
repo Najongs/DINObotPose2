@@ -428,6 +428,9 @@ class Trainer:
         self.local_rank = local_rank
         self.is_distributed = local_rank != -1
         self.is_main_process = (not self.is_distributed) or (local_rank == 0)
+        self.warmup_steps = max(0, int(config.get('warmup_steps', 0)))
+        self.warmup_start_lr = float(config.get('warmup_start_lr', 1e-8))
+        self.base_lrs = [group['lr'] for group in self.optimizer.param_groups]
 
         # Create output directory (only on main process)
         if self.is_main_process:
@@ -469,6 +472,13 @@ class Trainer:
         # Resume from checkpoint
         if resume_from:
             self._load_checkpoint(resume_from)
+            self.base_lrs = [group['lr'] for group in self.optimizer.param_groups]
+
+        self.global_step = self.start_epoch * len(self.train_loader)
+
+        # Apply step-based warmup LR before first epoch starts
+        if self.warmup_steps > 0 and self.global_step < self.warmup_steps:
+            self._apply_step_warmup_lr()
 
         # Save config (only on main process)
         if self.is_main_process:
@@ -519,6 +529,14 @@ class Trainer:
         else:
             # Unknown scheduler, return current LR
             return self.optimizer.param_groups[0]['lr']
+
+    def _apply_step_warmup_lr(self):
+        """Linearly increase LR for the first warmup_steps optimizer steps."""
+        if self.warmup_steps <= 0 or self.global_step >= self.warmup_steps:
+            return
+        progress = self.global_step / max(1, self.warmup_steps)
+        for idx, param_group in enumerate(self.optimizer.param_groups):
+            param_group['lr'] = self.warmup_start_lr + (self.base_lrs[idx] - self.warmup_start_lr) * progress
 
     def _load_checkpoint(self, checkpoint_path: str):
         """Load checkpoint for resuming training"""
@@ -784,6 +802,7 @@ class Trainer:
         batch_idx = 0
         for batch in pbar:
             batch_idx += 1
+            self._apply_step_warmup_lr()
             images, gt_dict, camera_K, orig_size_list, gt_angles, gt_2d_image = self._prepare_batch(batch)
 
             # Forward pass
@@ -800,6 +819,7 @@ class Trainer:
             loss.backward()
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
             self.optimizer.step()
+            self.global_step += 1
 
             # Record losses
             for key, value in loss_dict.items():
@@ -1545,6 +1565,12 @@ def main(args):
 
     if is_main_process:
         print(f"3D prediction mode: joint_angle")
+        print(
+            f"Optimization config: optimizer={args.optimizer}, "
+            f"scheduler={args.scheduler}, lr={args.learning_rate:.2e}, "
+            f"warmup_steps={args.warmup_steps}, warmup_start_lr={args.warmup_start_lr:.2e}, "
+            f"resume={'yes' if args.resume else 'no'}"
+        )
 
     use_iter_refine = getattr(args, 'use_iterative_refinement', False)
     refine_iters = getattr(args, 'refinement_iterations', 3)
@@ -1626,10 +1652,8 @@ def main(args):
     else:
         raise ValueError(f"Unknown optimizer: {args.optimizer}")
 
-    # Learning rate scheduler with warmup (skip warmup if resuming)
+    # Learning rate scheduler (warmup is handled per-step in Trainer)
     scheduler = None
-    warmup_epochs = 5  # Number of warmup epochs
-    use_warmup = args.scheduler == 'cosine' and not args.resume  # Only warmup for cosine and new training
 
     if args.scheduler == 'step':
         scheduler = optim.lr_scheduler.StepLR(
@@ -1638,35 +1662,16 @@ def main(args):
             gamma=args.lr_gamma
         )
     elif args.scheduler == 'cosine':
-        if use_warmup:
-            # Warmup + Cosine schedule (only for new training, not resume)
-            from torch.optim.lr_scheduler import SequentialLR, LinearLR
-            warmup_scheduler = LinearLR(
-                optimizer,
-                start_factor=0.1,
-                total_iters=warmup_epochs
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=args.epochs,
+            eta_min=args.min_lr
+        )
+        if is_main_process:
+            print(
+                f"Using CosineAnnealingLR: initial_lr={args.learning_rate}, min_lr={args.min_lr}, "
+                f"T_max={args.epochs}, warmup_steps={args.warmup_steps}, warmup_start_lr={args.warmup_start_lr}"
             )
-            cosine_scheduler = optim.lr_scheduler.CosineAnnealingLR(
-                optimizer,
-                T_max=args.epochs - warmup_epochs,
-                eta_min=args.min_lr
-            )
-            scheduler = SequentialLR(
-                optimizer,
-                schedulers=[warmup_scheduler, cosine_scheduler],
-                milestones=[warmup_epochs]
-            )
-            if is_main_process:
-                print(f"Using Warmup({warmup_epochs}ep) + CosineAnnealingLR: initial_lr={args.learning_rate}, min_lr={args.min_lr}, T_max={args.epochs}")
-        else:
-            # Just cosine (for resume)
-            scheduler = optim.lr_scheduler.CosineAnnealingLR(
-                optimizer,
-                T_max=args.epochs,
-                eta_min=args.min_lr
-            )
-            if is_main_process:
-                print(f"Using CosineAnnealingLR: initial_lr={args.learning_rate}, min_lr={args.min_lr}, T_max={args.epochs}")
     elif args.scheduler == 'plateau':
         scheduler = optim.lr_scheduler.ReduceLROnPlateau(
             optimizer,
@@ -1693,6 +1698,8 @@ def main(args):
         'optimizer': args.optimizer,
         'learning_rate': args.learning_rate,
         'min_lr': args.min_lr,
+        'warmup_steps': args.warmup_steps,
+        'warmup_start_lr': args.warmup_start_lr,
         'weight_decay': args.weight_decay,
         'scheduler': args.scheduler,
         'heatmap_weight': args.heatmap_weight,
@@ -1778,7 +1785,7 @@ if __name__ == '__main__':
     parser.add_argument('--optimizer', type=str, default='adam',
                         choices=['adam', 'adamw', 'sgd'],
                         help='Optimizer type')
-    parser.add_argument('--learning-rate', '--lr', type=float, default=1e-4,
+    parser.add_argument('--learning-rate', '--lr', type=float, default=1e-3,
                         help='Learning rate')
     parser.add_argument('--weight-decay', type=float, default=1e-5,
                         help='Weight decay')
@@ -1793,6 +1800,10 @@ if __name__ == '__main__':
                         help='Gamma for StepLR scheduler')
     parser.add_argument('--min-lr', type=float, default=1e-8,
                         help='Minimum learning rate for CosineAnnealingLR scheduler')
+    parser.add_argument('--warmup-steps', type=int, default=200,
+                        help='Warmup optimizer steps (0 disables warmup)')
+    parser.add_argument('--warmup-start-lr', type=float, default=1e-8,
+                        help='Warmup start LR (absolute value)')
 
     # Loss weights
     parser.add_argument('--loss-type', type=str, default='smoothl1',

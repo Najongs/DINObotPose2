@@ -8,14 +8,14 @@
 # =============================================================================
 
 # Data paths (REQUIRED - Update these paths!)
-DATA_DIR="/data/public/NAS/DINObotPose2/Dataset/Converted_dataset/DREAM_to_DREAM_syn/panda_synth_train_dr"  # Training data directory
-VAL_DIR="/data/public/NAS/DINObotPose2/Dataset/Converted_dataset/DREAM_to_DREAM_syn/panda_synth_test_dr"  
+# DATA_DIR="/data/public/NAS/DINObotPose2/Dataset/Converted_dataset/DREAM_to_DREAM_syn/panda_synth_train_dr"  # Training data directory
+# VAL_DIR="/data/public/NAS/DINObotPose2/Dataset/Converted_dataset/DREAM_to_DREAM_syn/panda_synth_test_dr"  
 
-# DATA_DIR="/home/najo/NAS/DIP/2025_ICRA_Multi_View_Robot_Pose_Estimation/dataset/Converted_dataset/DREAM_to_DREAM_syn/panda_synth_train_dr"  # Training data directory
-# VAL_DIR="/home/najo/NAS/DIP/2025_ICRA_Multi_View_Robot_Pose_Estimation/dataset/DREAM_syn/panda_synth_test_dr"  # Validation data directory (separate from training)
+DATA_DIR="/home/najo/NAS/DIP/2025_ICRA_Multi_View_Robot_Pose_Estimation/dataset/Converted_dataset/DREAM_to_DREAM_syn/panda_synth_train_dr"  # Training data directory
+VAL_DIR="/home/najo/NAS/DIP/2025_ICRA_Multi_View_Robot_Pose_Estimation/dataset/Converted_dataset/DREAM_to_DREAM/panda-3cam_azure"  # Validation data directory (separate from training)
 
 TRAIN_SPLIT=1.0  # Train split ratio (1.0 = use all training data when VAL_DIR is specified)
-VAL_SPLIT=0.1  # Validation data usage ratio (0.1 = use 10% of validation data)
+VAL_SPLIT=0.5  # Validation data usage ratio (0.1 = use 10% of validation data)
 
 # Model configuration
 MODEL_NAME='facebook/dinov3-vitb16-pretrain-lvd1689m'
@@ -43,8 +43,8 @@ KP3D_WEIGHT=100.0
 HEATMAP_ONLY_TRAIN=True  # True: train only 2D heatmap branch
 
 # FDA (Fourier Domain Adaptation) for sim-to-real
-FDA_REAL_DIR="/data/public/NAS/DINObotPose2/Dataset/DREAM_real"  # Real images (no labels needed)
-# FDA_REAL_DIR="/home/najo/NAS/DIP/2025_ICRA_Multi_View_Robot_Pose_Estimation/dataset/DREAM_real"
+# FDA_REAL_DIR="/data/public/NAS/DINObotPose2/Dataset/DREAM_real"  # Real images (no labels needed)
+FDA_REAL_DIR="/home/najo/NAS/DIP/2025_ICRA_Multi_View_Robot_Pose_Estimation/dataset/DREAM_real"
 FDA_BETA=0.001   # Low-freq replacement ratio (0.01=subtle tone shift, 0.05=strong)
 FDA_PROB=0.5    # Probability of applying FDA per sample (0.0 to disable)
 
@@ -70,7 +70,7 @@ WANDB_RUN_NAME="dinov3_base_$(date +%Y%m%d_%H%M%S)"
 
 # Other settings
 SEED=42
-RESUME=""  # Path to checkpoint for resuming (leave empty for new training)
+RESUME="/home/najo/NAS/DIP/DINObotPose2/Train/outputs/dinov3_base_20260228_000118/epoch_7.pth"  # Path to checkpoint for resuming (leave empty for new training)
 RESUME_LR=""  # Learning rate to use when resuming (leave empty for automatic calculation from scheduler)
 LOAD_2D_HEAD=""  # Path to checkpoint for loading pretrained 2D heatmap head (leave empty to train from scratch)
 
@@ -85,8 +85,8 @@ LOAD_2D_HEAD=""  # Path to checkpoint for loading pretrained 2D heatmap head (le
 
 # --- Multi-GPU Training (Distributed Data Parallel) ---
 TRAIN_MODE="multi_gpu"
-NUM_GPUS=3  # 사용할 GPU 개수 (single GPU는 1로 설정)
-GPU_IDS="0,1,2"  # 사용할 GPU ID (예: "0,1,2,3")
+NUM_GPUS=5  # 사용할 GPU 개수 (single GPU는 1로 설정)
+GPU_IDS="0,1,2,3,4"  # 사용할 GPU ID (예: "0,1,2,3")
 
 # =============================================================================
 # Execute Training

@@ -64,8 +64,8 @@ WANDB_RUN_NAME="dinov3_base_$(date +%Y%m%d_%H%M%S)"
 
 # Other settings
 SEED=42
-RESUME="/data/public/NAS/DINObotPose2/Train/outputs/dinov3_base_20260227_002500/epoch_1.pth"  # Path to checkpoint for resuming (leave empty for new training)
-LOAD_2D_HEAD=""  # Path to checkpoint for loading pretrained 2D heatmap head (leave empty to train from scratch)
+RESUME=""  # Path to checkpoint for resuming (leave empty for new training)
+LOAD_2D_HEAD="/data/public/NAS/DINObotPose2/Train/outputs/dinov3_base_20260227_005854/epoch_3.pth"  # Path to checkpoint for loading pretrained 2D heatmap head (leave empty to train from scratch)
 
 # =============================================================================
 # Training Modes

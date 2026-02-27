@@ -39,6 +39,7 @@ class InferenceDataset(Dataset):
         self.data_dir = Path(data_dir)
         self.keypoint_names = keypoint_names
         self.image_size = image_size
+        self.is_synthetic = 'syn' in str(self.data_dir).lower()
 
         self.json_files = sorted(list(self.data_dir.glob("*.json")))
         if len(self.json_files) == 0:
@@ -51,6 +52,8 @@ class InferenceDataset(Dataset):
         ])
 
         print(f"Found {len(self.json_files)} json frames in {data_dir}")
+        if self.is_synthetic:
+            print(f"  Detected as SYNTHETIC data (3D GT will be converted cm -> m)")
 
     def __len__(self):
         return len(self.json_files)
@@ -97,7 +100,19 @@ class InferenceDataset(Dataset):
         keypoints_2d = np.array(keypoints_2d, dtype=np.float32)
         keypoints_3d = np.array(keypoints_3d, dtype=np.float32)
 
+        # Synthetic data (DREAM sim) uses cm, convert to meters
+        if self.is_synthetic:
+            keypoints_3d = keypoints_3d / 100.0
+
         image_tensor = self.transform(image)
+
+        # Per-sample camera intrinsics
+        camera_K = np.zeros((3, 3), dtype=np.float32)
+        if "meta" in data and "K" in data["meta"]:
+            camera_K = np.array(data["meta"]["K"], dtype=np.float32)
+
+        # Original image size (W, H)
+        original_size = np.array([image.width, image.height], dtype=np.float32)
 
         # Angles (same)
         angles = np.zeros(9, dtype=np.float32)
@@ -111,6 +126,8 @@ class InferenceDataset(Dataset):
             "image": image_tensor,
             "keypoints": keypoints_2d,
             "keypoints_3d": keypoints_3d,
+            "camera_K": camera_K,
+            "original_size": original_size,
             "angles": angles,
             "image_path": str(img_path),
             "name": json_path.stem,
@@ -551,9 +568,9 @@ def run_inference(args):
     all_kp_pos_gt = []
     all_n_inframe_projs_gt = []
     all_pred_3d = []  # Model's direct 3D predictions
-
-    # Prepare camera_K tensor for depth_only mode
-    camera_K_tensor = torch.tensor(camera_K, dtype=torch.float32).to(device) if camera_K is not None else None
+    all_camera_Ks = []  # Per-sample camera intrinsics
+    all_joint_angles_pred = []  # Joint angle predictions (if joint_angle mode)
+    all_joint_angles_gt = []  # GT joint angles
 
     print(f"\nRunning inference on {len(dataset)} images...")
 
@@ -561,25 +578,33 @@ def run_inference(args):
         images = batch['image'].to(device)
         gt_keypoints = batch['keypoints'].numpy()
         gt_keypoints_3d = batch['keypoints_3d'].numpy()
+        batch_camera_K = batch['camera_K'].to(device)  # (B, 3, 3) per-sample K
+        batch_original_size = batch['original_size'].numpy()  # (B, 2)
+        gt_angles = batch['angles'].numpy()  # (B, 9)
 
-        # Prepare batched camera_K for depth_only mode
-        batch_camera_K = None
-        if camera_K_tensor is not None:
-            batch_camera_K = camera_K_tensor.unsqueeze(0).expand(images.shape[0], -1, -1)
-
-        # Forward pass
-        outputs = model(images, camera_K=batch_camera_K, original_size=raw_resolution)
+        # Forward pass (use per-sample camera_K and first sample's original_size)
+        # Note: original_size is typically the same for all samples in a dataset
+        orig_size = tuple(batch_original_size[0].astype(int).tolist())
+        outputs = model(images, camera_K=batch_camera_K, original_size=orig_size)
         pred_heatmaps = outputs["heatmaps_2d"]
         pred_kpts_3d = outputs["keypoints_3d"].cpu().numpy()  # (B, N_kp, 3)
+
+        # Collect joint angles if available
+        if "joint_angles" in outputs and outputs["joint_angles"] is not None:
+            all_joint_angles_pred.append(outputs["joint_angles"].cpu().numpy())
 
         # Extract keypoints from heatmaps
         pred_keypoints = get_keypoints_from_heatmaps(pred_heatmaps)
 
-        # Scale to raw resolution
-        scale_x = raw_resolution[0] / heatmap_size
-        scale_y = raw_resolution[1] / heatmap_size
-
         for i in range(len(pred_keypoints)):
+            # Per-sample raw resolution and camera K
+            sample_raw_w, sample_raw_h = batch_original_size[i].astype(int)
+            sample_camera_K = batch_camera_K[i].cpu().numpy()
+
+            # Scale to raw resolution
+            scale_x = sample_raw_w / heatmap_size
+            scale_y = sample_raw_h / heatmap_size
+
             # Scale predictions to raw resolution
             pred_kp_scaled = pred_keypoints[i].copy()
             pred_kp_scaled[:, 0] *= scale_x
@@ -587,21 +612,22 @@ def run_inference(args):
 
             # Transform 3D predictions from robot frame to camera frame if MODE_JOINT_ANGLE
             pred_3d_sample = pred_kpts_3d[i]
-            if mode_3d == MODE_JOINT_ANGLE and camera_K is not None:
-                pred_3d_camera = transform_robot_to_camera(pred_3d_sample, pred_kp_scaled, camera_K)
+            if mode_3d == MODE_JOINT_ANGLE and sample_camera_K is not None:
+                pred_3d_camera = transform_robot_to_camera(pred_3d_sample, pred_kp_scaled, sample_camera_K)
                 if pred_3d_camera is not None:
                     pred_3d_sample = pred_3d_camera
-                # If PnP fails, keep robot frame coordinates (will be flagged in metrics)
 
             all_kp_projs_detected.append(pred_kp_scaled)
             all_kp_projs_gt.append(gt_keypoints[i])
             all_kp_pos_gt.append(gt_keypoints_3d[i])
             all_pred_3d.append(pred_3d_sample)
+            all_camera_Ks.append(sample_camera_K)
+            all_joint_angles_gt.append(gt_angles[i])
 
             # Count in-frame GT keypoints
             n_inframe = 0
             for kp in gt_keypoints[i]:
-                if 0 <= kp[0] <= raw_resolution[0] and 0 <= kp[1] <= raw_resolution[1]:
+                if 0 <= kp[0] <= sample_raw_w and 0 <= kp[1] <= sample_raw_h:
                     n_inframe += 1
             all_n_inframe_projs_gt.append(n_inframe)
 
@@ -609,6 +635,11 @@ def run_inference(args):
     all_kp_projs_gt = np.array(all_kp_projs_gt)
     all_kp_pos_gt = np.array(all_kp_pos_gt)
     all_pred_3d = np.array(all_pred_3d)
+    all_joint_angles_gt = np.array(all_joint_angles_gt)
+    if all_joint_angles_pred:
+        all_joint_angles_pred = np.concatenate(all_joint_angles_pred, axis=0)
+    else:
+        all_joint_angles_pred = None
 
     # Compute keypoint metrics (2D)
     print("\nComputing keypoint metrics...")
@@ -632,8 +663,10 @@ def run_inference(args):
     print("Computing PnP ADD metrics (DREAM baseline)...")
     pnp_adds = []
 
-    for kp_det, kp_gt, kp_3d, n_inframe in tqdm(
-        zip(all_kp_projs_detected, all_kp_projs_gt, all_kp_pos_gt, all_n_inframe_projs_gt),
+    from scipy.spatial.transform import Rotation
+
+    for kp_det, kp_gt, kp_3d, n_inframe, sample_K in tqdm(
+        zip(all_kp_projs_detected, all_kp_projs_gt, all_kp_pos_gt, all_n_inframe_projs_gt, all_camera_Ks),
         total=len(all_kp_projs_detected),
         desc="PnP solving"
     ):
@@ -644,28 +677,23 @@ def run_inference(args):
             kp_det_pnp = kp_det[idx_good]
             kp_3d_pnp = kp_3d[idx_good]
 
-            # Solve PnP using EPnP
+            # Solve PnP using EPnP with per-sample camera K
             try:
                 success, rvec, tvec = cv2.solvePnP(
                     kp_3d_pnp.astype(np.float64),
                     kp_det_pnp.astype(np.float64),
-                    camera_K.astype(np.float64),
+                    sample_K.astype(np.float64),
                     None,  # No distortion
                     flags=cv2.SOLVEPNP_EPNP
                 )
 
                 if success:
-                    # Convert to rotation matrix and quaternion for DREAM compatibility
                     R, _ = cv2.Rodrigues(rvec)
                     t = tvec.flatten()
-
-                    # Convert R to quaternion (xyzw format for scipy)
-                    from scipy.spatial.transform import Rotation
                     quaternion = Rotation.from_matrix(R).as_quat()  # [x, y, z, w]
 
-                    # Use DREAM's ADD computation
                     add = dream.geometric_vision.add_from_pose(
-                        t, quaternion, kp_3d_pnp, camera_K
+                        t, quaternion, kp_3d_pnp, sample_K
                     )
                     pnp_adds.append(add)
                 else:
@@ -728,6 +756,34 @@ def run_inference(args):
         print(f"#    PnP Success Rate: {pnp_metrics['num_pnp_found']}/{pnp_metrics['num_pnp_possible']} ({pnp_metrics['num_pnp_found']/max(1, pnp_metrics['num_pnp_possible'])*100:.1f}%)")
     else:
         print("#    No successful PnP solutions")
+
+    # Joint angle metrics (if joint_angle mode)
+    joint_angle_metrics = {}
+    if all_joint_angles_pred is not None and mode_3d == MODE_JOINT_ANGLE:
+        # Compare predicted vs GT joint angles (7 active joints: indices 0-6)
+        gt_angles_7 = all_joint_angles_gt[:, :7]  # (N, 7) first 7 joints
+        pred_angles_7 = all_joint_angles_pred[:, :7] if all_joint_angles_pred.shape[1] >= 7 else all_joint_angles_pred
+
+        # Only compare where GT angles are not all zero
+        valid_mask = np.any(gt_angles_7 != 0, axis=-1)
+        if valid_mask.sum() > 0:
+            gt_valid = gt_angles_7[valid_mask]
+            pred_valid = pred_angles_7[valid_mask]
+            angle_errors = np.abs(pred_valid - gt_valid)  # (N_valid, 7)
+            angle_errors_deg = np.degrees(angle_errors)
+
+            joint_angle_metrics = {
+                'num_frames': int(valid_mask.sum()),
+                'mean_rad': float(np.mean(angle_errors)),
+                'mean_deg': float(np.mean(angle_errors_deg)),
+                'per_joint_mean_deg': [float(x) for x in np.mean(angle_errors_deg, axis=0)],
+            }
+
+            print(f"\n# Joint Angle Error (n = {joint_angle_metrics['num_frames']}):")
+            print(f"#    Mean: {joint_angle_metrics['mean_rad']:.4f} rad ({joint_angle_metrics['mean_deg']:.2f} deg)")
+            joint_names = ['joint1', 'joint2', 'joint3', 'joint4', 'joint5', 'joint6', 'joint7']
+            for j, (jname, jerr) in enumerate(zip(joint_names, joint_angle_metrics['per_joint_mean_deg'])):
+                print(f"#      {jname}: {jerr:.2f} deg")
 
     print("=" * 80)
 

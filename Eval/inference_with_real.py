@@ -352,6 +352,15 @@ def network_inference(args):
         print(f"  Median 3D error: {metrics['median_3d_m']:.4f} m ({metrics['median_3d_m']*100:.2f} cm)")
         print(f"  Max 3D error:    {metrics['max_3d_m']:.4f} m ({metrics['max_3d_m']*100:.2f} cm)")
 
+    # Joint angle output (if joint_angle mode)
+    if "joint_angles" in outputs and outputs["joint_angles"] is not None:
+        pred_angles = outputs["joint_angles"][0].cpu().numpy()
+        joint_names = ['joint1', 'joint2', 'joint3', 'joint4', 'joint5', 'joint6', 'joint7']
+        print(f"\n{'Joint':<12} {'Pred (rad)':<14} {'Pred (deg)':<14}")
+        print("-" * 40)
+        for j in range(min(len(joint_names), len(pred_angles))):
+            print(f"  {joint_names[j]:<10} {pred_angles[j]:10.4f}   {np.degrees(pred_angles[j]):10.2f}")
+
     print("=" * 80)
 
     # === Visualizations ===

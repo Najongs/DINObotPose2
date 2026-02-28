@@ -149,11 +149,17 @@ def load_annotation(json_path, keypoint_names):
 def compute_metrics(pred_2d, gt_2d, pred_3d, gt_3d, keypoint_names, found, orig_image_dim):
     """Compute per-keypoint and overall error metrics."""
     metrics = {}
+    img_w, img_h = orig_image_dim
 
     # 2D pixel error (L2 distance)
     errors_2d = []
     for i, name in enumerate(keypoint_names):
-        if found[i]:
+        in_frame = (
+            found[i] and
+            (0.0 <= gt_2d[i][0] <= img_w) and
+            (0.0 <= gt_2d[i][1] <= img_h)
+        )
+        if in_frame:
             err = np.linalg.norm(pred_2d[i] - gt_2d[i])
             errors_2d.append(err)
             metrics[f'{name}_2d_px'] = err
@@ -168,7 +174,12 @@ def compute_metrics(pred_2d, gt_2d, pred_3d, gt_3d, keypoint_names, found, orig_
     # 3D Euclidean error (meters)
     errors_3d = []
     for i, name in enumerate(keypoint_names):
-        if found[i] and not np.allclose(gt_3d[i], 0):
+        in_frame = (
+            found[i] and
+            (0.0 <= gt_2d[i][0] <= img_w) and
+            (0.0 <= gt_2d[i][1] <= img_h)
+        )
+        if in_frame and not np.allclose(gt_3d[i], 0):
             err = np.linalg.norm(pred_3d[i] - gt_3d[i])
             errors_3d.append(err)
             metrics[f'{name}_3d_m'] = err
@@ -192,6 +203,10 @@ def network_inference(args):
 
     assert os.path.exists(args.json_path), \
         f'JSON path "{args.json_path}" does not exist.'
+    assert args.json_path.lower().endswith('.json'), \
+        f'--json-path must be a .json annotation file, got "{args.json_path}"'
+    assert os.path.exists(args.model_path), \
+        f'Model path "{args.model_path}" does not exist.'
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"# Using device: {device}")
@@ -332,9 +347,14 @@ def network_inference(args):
     print(f"\n{'Keypoint':<20} {'GT 2D (px)':<22} {'Pred 2D (px)':<22} {'2D Err (px)':<12}")
     print("-" * 76)
     for i, name in enumerate(keypoint_names):
+        in_frame = (
+            found[i] and
+            (0.0 <= gt_2d[i][0] <= orig_dim[0]) and
+            (0.0 <= gt_2d[i][1] <= orig_dim[1])
+        )
         gt_str = f"({gt_2d[i][0]:7.1f}, {gt_2d[i][1]:7.1f})" if found[i] else "  N/A"
         pred_str = f"({pred_2d_orig[i][0]:7.1f}, {pred_2d_orig[i][1]:7.1f})"
-        err_str = f"{metrics.get(f'{name}_2d_px', float('nan')):8.2f}" if found[i] else "  N/A"
+        err_str = f"{metrics.get(f'{name}_2d_px', float('nan')):8.2f}" if in_frame else "  N/A"
         print(f"  {name:<18} {gt_str:<22} {pred_str:<22} {err_str}")
 
     print(f"\n  Mean 2D error:   {metrics.get('mean_2d_px', float('nan')):.2f} px")
@@ -345,7 +365,12 @@ def network_inference(args):
     print(f"\n{'Keypoint':<20} {'GT 3D (m)':<30} {'Pred 3D (m)':<30} {'3D Err (m)':<12}")
     print("-" * 92)
     for i, name in enumerate(keypoint_names):
-        if found[i] and not np.allclose(gt_3d[i], 0):
+        in_frame = (
+            found[i] and
+            (0.0 <= gt_2d[i][0] <= orig_dim[0]) and
+            (0.0 <= gt_2d[i][1] <= orig_dim[1])
+        )
+        if in_frame and not np.allclose(gt_3d[i], 0):
             gt_str = f"({gt_3d[i][0]:8.4f}, {gt_3d[i][1]:8.4f}, {gt_3d[i][2]:8.4f})"
             pred_str = f"({pred_3d[i][0]:8.4f}, {pred_3d[i][1]:8.4f}, {pred_3d[i][2]:8.4f})"
             err_str = f"{metrics.get(f'{name}_3d_m', float('nan')):.4f}"

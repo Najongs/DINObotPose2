@@ -9,7 +9,7 @@ import time
 import pickle
 import random
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple, List
 from datetime import timedelta
 
 import numpy as np
@@ -123,6 +123,10 @@ class UnifiedPoseLoss(nn.Module):
         direct_3d_weight: float = 5.0,  # Direct 3D branch supervision weight (robot frame)
         consistency_weight: float = 1.0,  # FK branch vs direct branch consistency weight
         fusion_delta_weight: float = 0.1,  # Residual correction regularization weight
+        use_hard_sample_3d_reweight: bool = False,  # Train-time hard sample upweighting for 3D losses
+        hard_sample_3d_power: float = 1.0,  # weight = (err / mean_err) ** power
+        hard_sample_3d_max_weight: float = 3.0,  # clamp upper bound for stability
+        keypoint_3d_weights: Optional[List[float]] = None,  # Optional per-keypoint weights for 3D losses
     ):
         super().__init__()
         self.heatmap_weight = heatmap_weight
@@ -138,6 +142,14 @@ class UnifiedPoseLoss(nn.Module):
         self.direct_3d_weight = direct_3d_weight
         self.consistency_weight = consistency_weight
         self.fusion_delta_weight = fusion_delta_weight
+        self.use_hard_sample_3d_reweight = use_hard_sample_3d_reweight
+        self.hard_sample_3d_power = hard_sample_3d_power
+        self.hard_sample_3d_max_weight = hard_sample_3d_max_weight
+        if keypoint_3d_weights is not None:
+            kp_w = torch.tensor(keypoint_3d_weights, dtype=torch.float32)
+            self.register_buffer('keypoint_3d_weights', kp_w)
+        else:
+            self.register_buffer('keypoint_3d_weights', None)
 
         # Heatmap loss: 항상 MSE 사용 (값 범위 0~1, Gaussian GT와 MSE가 자연스러움)
         self.heatmap_loss_fn = nn.MSELoss(reduction='none')
@@ -161,6 +173,42 @@ class UnifiedPoseLoss(nn.Module):
 
         self.eps = 1e-6  # Numerical stability
 
+    def _reduce_with_optional_weights(self, diff, valid_mask=None, sample_weights=None, keypoint_weights=None):
+        """Reduce element-wise loss to scalar with optional valid mask and sample weights."""
+        B = diff.shape[0]
+        kp_weights = None
+        if keypoint_weights is not None and diff.dim() >= 2 and diff.shape[1] == keypoint_weights.numel():
+            kp_weights = keypoint_weights.to(diff.device)
+
+        if valid_mask is not None and diff.dim() >= 2 and valid_mask.shape[0] == B:
+            joint_weight = valid_mask.float()
+            if kp_weights is not None:
+                joint_weight = joint_weight * kp_weights.unsqueeze(0)
+
+            mask = joint_weight
+            while mask.dim() < diff.dim():
+                mask = mask.unsqueeze(-1)
+            diff = diff * mask
+            per_sample = diff.view(B, -1).sum(dim=1) / (joint_weight.sum(dim=1) + self.eps)
+        else:
+            if kp_weights is not None and diff.dim() >= 2 and diff.shape[1] == kp_weights.numel():
+                mask = kp_weights.view(1, -1, *([1] * (diff.dim() - 2)))
+                diff = diff * mask
+                per_sample = diff.view(B, -1).sum(dim=1) / (kp_weights.sum() + self.eps)
+            else:
+                per_sample = diff.view(B, -1).mean(dim=1)
+
+        if sample_weights is not None:
+            weighted = per_sample * sample_weights
+            return weighted.sum() / (sample_weights.sum() + self.eps), per_sample
+        return per_sample.mean(), per_sample
+
+    def _compute_hard_sample_weights(self, sample_error):
+        """Compute detached hard-sample weights from per-sample error."""
+        rel_error = sample_error.detach() / (sample_error.detach().mean() + self.eps)
+        weights = torch.clamp(rel_error.pow(self.hard_sample_3d_power), min=1.0, max=self.hard_sample_3d_max_weight)
+        return weights
+
     def forward(self, pred_dict, gt_dict):
         """
         Args:
@@ -176,6 +224,30 @@ class UnifiedPoseLoss(nn.Module):
         """
         # Get valid mask
         valid_mask = gt_dict.get('valid_mask', None)  # (B, MAX_JOINTS)
+        sample_weights_3d = None
+        gt_kp_robot = None
+        if 'angles' in gt_dict:
+            gt_kp_robot = panda_forward_kinematics(gt_dict['angles'])
+
+        # Train-time hard sample upweighting for 3D-related losses only
+        if self.use_hard_sample_3d_reweight and self.training:
+            anchor_error = None
+            if 'joint_angles' in pred_dict and 'angles' in gt_dict:
+                angle_diff = self.loss_fn(pred_dict['joint_angles'], gt_dict['angles'])  # (B, 7)
+                anchor_error = angle_diff.mean(dim=1)  # (B,)
+            elif 'keypoints_3d_fk' in pred_dict and gt_kp_robot is not None:
+                fk_diff = self.loss_fn(pred_dict['keypoints_3d_fk'], gt_kp_robot)  # (B, 7, 3)
+                _, anchor_error = self._reduce_with_optional_weights(
+                    fk_diff, valid_mask=valid_mask, keypoint_weights=self.keypoint_3d_weights
+                )
+            elif 'keypoints_3d' in pred_dict and 'keypoints_3d' in gt_dict:
+                kp_diff = self.loss_fn(pred_dict['keypoints_3d'], gt_dict['keypoints_3d'])  # (B, J, 3)
+                _, anchor_error = self._reduce_with_optional_weights(
+                    kp_diff, valid_mask=valid_mask, keypoint_weights=self.keypoint_3d_weights
+                )
+
+            if anchor_error is not None:
+                sample_weights_3d = self._compute_hard_sample_weights(anchor_error)
 
         # 1. 2D Heatmap Loss (항상 MSE: Gaussian GT와 자연스러운 조합)
         if valid_mask is not None:
@@ -192,13 +264,20 @@ class UnifiedPoseLoss(nn.Module):
         kp3d_gt = gt_dict['keypoints_3d']
 
         if valid_mask is not None:
-            mask_expanded = valid_mask.unsqueeze(-1).float()  # (B, MAX_JOINTS, 1)
             kp3d_diff = self.loss_fn(kp3d_pred, kp3d_gt)  # (B, MAX_JOINTS, 3)
-            kp3d_diff_masked = kp3d_diff * mask_expanded
-            loss_kp3d = kp3d_diff_masked.sum() / (mask_expanded.sum() + self.eps)
+            loss_kp3d, _ = self._reduce_with_optional_weights(
+                kp3d_diff,
+                valid_mask=valid_mask,
+                sample_weights=sample_weights_3d if self.kp3d_weight > 0 else None,
+                keypoint_weights=self.keypoint_3d_weights
+            )
         else:
             kp3d_diff = self.loss_fn(kp3d_pred, kp3d_gt)
-            loss_kp3d = kp3d_diff.mean()
+            loss_kp3d, _ = self._reduce_with_optional_weights(
+                kp3d_diff,
+                sample_weights=sample_weights_3d if self.kp3d_weight > 0 else None,
+                keypoint_weights=self.keypoint_3d_weights
+            )
 
         # Total Loss with Adaptive Weighting or Fixed Weights
         # kp3d_weight=0이면 (joint_angle 모드 등) kp3d loss를 total에서 완전히 제외
@@ -235,39 +314,50 @@ class UnifiedPoseLoss(nn.Module):
                 'heatmap': loss_heatmap.item(),
                 'kp3d': loss_kp3d.item(),
             }
-
-        gt_kp_robot = None
-        if 'angles' in gt_dict:
-            gt_kp_robot = panda_forward_kinematics(gt_dict['angles'])
+        if sample_weights_3d is not None:
+            loss_dict['hard_w_mean'] = sample_weights_3d.mean().item()
+            loss_dict['hard_w_max'] = sample_weights_3d.max().item()
 
         # Joint angle loss (joint_angle mode only)
         if self.angle_weight > 0 and 'joint_angles' in pred_dict and 'angles' in gt_dict:
             pred_angles = pred_dict['joint_angles']  # (B, 7)
             gt_angles = gt_dict['angles']  # (B, 7)
-            loss_angle = self.loss_fn(pred_angles, gt_angles).mean()
+            angle_diff = self.loss_fn(pred_angles, gt_angles)
+            loss_angle, _ = self._reduce_with_optional_weights(
+                angle_diff, sample_weights=sample_weights_3d
+            )
             total_loss = total_loss + self.angle_weight * loss_angle
             loss_dict['angle'] = loss_angle.item()
 
         # FK 3D loss: compare FK(pred_angles) vs FK(gt_angles) in robot frame
         if self.fk_3d_weight > 0 and 'keypoints_3d_fk' in pred_dict and gt_kp_robot is not None:
             pred_kp_fk = pred_dict['keypoints_3d_fk']  # (B, 7, 3)
-            loss_fk_3d = self.loss_fn(pred_kp_fk, gt_kp_robot).mean()
+            fk_diff = self.loss_fn(pred_kp_fk, gt_kp_robot)
+            loss_fk_3d, _ = self._reduce_with_optional_weights(
+                fk_diff, valid_mask=valid_mask, sample_weights=sample_weights_3d, keypoint_weights=self.keypoint_3d_weights
+            )
             total_loss = total_loss + self.fk_3d_weight * loss_fk_3d
             loss_dict['fk_3d'] = loss_fk_3d.item()
 
         # Direct 3D branch supervision (robot frame)
         if self.direct_3d_weight > 0 and 'keypoints_3d_direct' in pred_dict and gt_kp_robot is not None:
             pred_kp_direct = pred_dict['keypoints_3d_direct']  # (B, 7, 3)
-            loss_direct_3d = self.loss_fn(pred_kp_direct, gt_kp_robot).mean()
+            direct_diff = self.loss_fn(pred_kp_direct, gt_kp_robot)
+            loss_direct_3d, _ = self._reduce_with_optional_weights(
+                direct_diff, valid_mask=valid_mask, sample_weights=sample_weights_3d, keypoint_weights=self.keypoint_3d_weights
+            )
             total_loss = total_loss + self.direct_3d_weight * loss_direct_3d
             loss_dict['direct_3d'] = loss_direct_3d.item()
 
         # Cross-branch consistency: FK branch <-> direct branch
         if self.consistency_weight > 0 and 'keypoints_3d_fk' in pred_dict and 'keypoints_3d_direct' in pred_dict:
-            loss_consistency = self.loss_fn(
+            consistency_diff = self.loss_fn(
                 pred_dict['keypoints_3d_fk'],
                 pred_dict['keypoints_3d_direct']
-            ).mean()
+            )
+            loss_consistency, _ = self._reduce_with_optional_weights(
+                consistency_diff, valid_mask=valid_mask, sample_weights=sample_weights_3d, keypoint_weights=self.keypoint_3d_weights
+            )
             total_loss = total_loss + self.consistency_weight * loss_consistency
             loss_dict['consistency'] = loss_consistency.item()
 
@@ -344,12 +434,23 @@ class UnifiedPoseLoss(nn.Module):
                         # Apply valid_mask if available (only for valid PnP samples)
                         if valid_mask is not None:
                             valid_mask_subset = valid_mask[valid_indices]  # (N_valid, 7)
-                            mask_expanded = valid_mask_subset.unsqueeze(-1).float()  # (N_valid, 7, 1)
                             camera_3d_diff = self.loss_fn(pred_kp_camera, gt_kp_camera_valid)
-                            camera_3d_diff_masked = camera_3d_diff * mask_expanded
-                            loss_camera_3d = camera_3d_diff_masked.sum() / (mask_expanded.sum() + self.eps)
+                            weight_subset = None
+                            if sample_weights_3d is not None:
+                                index_tensor = torch.as_tensor(valid_indices, dtype=torch.long, device=sample_weights_3d.device)
+                                weight_subset = sample_weights_3d[index_tensor]
+                            loss_camera_3d, _ = self._reduce_with_optional_weights(
+                                camera_3d_diff, valid_mask=valid_mask_subset, sample_weights=weight_subset, keypoint_weights=self.keypoint_3d_weights
+                            )
                         else:
-                            loss_camera_3d = self.loss_fn(pred_kp_camera, gt_kp_camera_valid).mean()
+                            camera_3d_diff = self.loss_fn(pred_kp_camera, gt_kp_camera_valid)
+                            weight_subset = None
+                            if sample_weights_3d is not None:
+                                index_tensor = torch.as_tensor(valid_indices, dtype=torch.long, device=sample_weights_3d.device)
+                                weight_subset = sample_weights_3d[index_tensor]
+                            loss_camera_3d, _ = self._reduce_with_optional_weights(
+                                camera_3d_diff, sample_weights=weight_subset, keypoint_weights=self.keypoint_3d_weights
+                            )
 
                         total_loss = total_loss + self.camera_3d_weight * loss_camera_3d
                         loss_dict['camera_3d'] = loss_camera_3d.item()
@@ -394,10 +495,16 @@ class UnifiedPoseLoss(nn.Module):
                 w = decay ** (N - step_i)  # later steps get higher weight
 
                 # Angle loss for this step
-                step_angle_loss = self.loss_fn(all_angles[step_i], gt_angles).mean()
+                step_angle_diff = self.loss_fn(all_angles[step_i], gt_angles)
+                step_angle_loss, _ = self._reduce_with_optional_weights(
+                    step_angle_diff, sample_weights=sample_weights_3d
+                )
 
                 # FK 3D loss for this step
-                step_fk_loss = self.loss_fn(all_kp3d[step_i], gt_kp_robot).mean()
+                step_fk_diff = self.loss_fn(all_kp3d[step_i], gt_kp_robot)
+                step_fk_loss, _ = self._reduce_with_optional_weights(
+                    step_fk_diff, valid_mask=valid_mask, sample_weights=sample_weights_3d, keypoint_weights=self.keypoint_3d_weights
+                )
 
                 step_loss = step_angle_loss + step_fk_loss
 
@@ -837,6 +944,8 @@ class Trainer:
         ('fusion_delta', 'fdlt'),
         ('camera_3d', 'cam3d'),
         ('refinement', 'ref'),
+        ('hard_w_mean', 'hwm'),
+        ('hard_w_max', 'hwx'),
     ]
 
     def _format_postfix(self, loss_dict):
@@ -866,6 +975,7 @@ class Trainer:
     def train_epoch(self, epoch: int) -> Dict[str, float]:
         """Train for one epoch"""
         self.model.train()
+        self.criterion.train()
 
         # Set sampler epoch for proper shuffling in distributed training
         if self.is_distributed and hasattr(self.train_loader.sampler, 'set_epoch'):
@@ -927,6 +1037,8 @@ class Trainer:
                         for key, wandb_key in [('angle', 'batch/train_angle_loss'),
                                                 ('fk_3d', 'batch/train_fk3d_loss'),
                                                 ('camera_3d', 'batch/train_camera3d_loss'),
+                                                ('hard_w_mean', 'batch/train_hard_w_mean'),
+                                                ('hard_w_max', 'batch/train_hard_w_max'),
                                                 ('pnp_success_rate', 'batch/pnp_success_rate'),
                                                 ('refinement', 'batch/train_refinement_loss')]:
                             if key in loss_dict:
@@ -951,6 +1063,7 @@ class Trainer:
     def validate(self, epoch: int) -> Dict[str, float]:
         """Validate the model"""
         self.model.eval()
+        self.criterion.eval()
 
         epoch_losses = {
             'total': [],
@@ -1672,24 +1785,49 @@ def main(args):
     use_iter_refine = False
     heatmap_only_train = getattr(args, 'heatmap_only_train', False)
     freeze_2d_head_epochs = max(0, int(getattr(args, 'freeze_2d_head_epochs', 0)))
-    if freeze_2d_head_epochs > 0 and not args.load_2d_head and is_main_process:
-        print("Warning: --freeze-2d-head-epochs is set but --load-2d-head is empty. Freeze schedule will be ignored.")
+    has_2d_source = bool(args.load_2d_head) or bool(args.resume)
+    if freeze_2d_head_epochs > 0 and not has_2d_source and is_main_process:
+        print("Warning: --freeze-2d-head-epochs is set but neither --load-2d-head nor --resume is provided. Freeze schedule will be ignored.")
     if heatmap_only_train and freeze_2d_head_epochs > 0 and is_main_process:
         print("Warning: --heatmap-only-train with --freeze-2d-head-epochs would freeze all trainable branches. Freeze schedule will be ignored.")
-    if not args.load_2d_head or heatmap_only_train:
+    if (not has_2d_source) or heatmap_only_train:
         freeze_2d_head_epochs = 0
     effective_use_iter_refine = False
 
     if is_main_process:
+        keypoint_3d_weights = None
+        if args.keypoint_3d_weights.strip():
+            keypoint_3d_weights = [float(x.strip()) for x in args.keypoint_3d_weights.split(',') if x.strip()]
+            if len(keypoint_3d_weights) != len(keypoint_names):
+                raise ValueError(
+                    f"--keypoint-3d-weights expects {len(keypoint_names)} values "
+                    f"(got {len(keypoint_3d_weights)}): {args.keypoint_3d_weights}"
+                )
+            kp_w_log = ", ".join(f"{k}:{w:.2f}" for k, w in zip(keypoint_names, keypoint_3d_weights))
+            print(f"3D keypoint weights: {kp_w_log}")
+        else:
+            keypoint_3d_weights = None
+
         print(f"3D prediction mode: joint_angle")
         print(
             f"Optimization config: optimizer={args.optimizer}, "
             f"scheduler={args.scheduler}, lr={args.learning_rate:.2e}, "
             f"warmup_steps={args.warmup_steps}, warmup_start_lr={args.warmup_start_lr:.2e}, "
             f"freeze_2d_head_epochs={freeze_2d_head_epochs}, "
+            f"hard3d={'on' if args.use_hard_sample_3d_reweight else 'off'}, "
             f"heatmap_only={'yes' if heatmap_only_train else 'no'}, "
             f"resume={'yes' if args.resume else 'no'}"
         )
+    else:
+        if args.keypoint_3d_weights.strip():
+            keypoint_3d_weights = [float(x.strip()) for x in args.keypoint_3d_weights.split(',') if x.strip()]
+            if len(keypoint_3d_weights) != len(keypoint_names):
+                raise ValueError(
+                    f"--keypoint-3d-weights expects {len(keypoint_names)} values "
+                    f"(got {len(keypoint_3d_weights)})"
+                )
+        else:
+            keypoint_3d_weights = None
 
     refine_iters = 0
 
@@ -1765,6 +1903,10 @@ def main(args):
         direct_3d_weight=0.0 if heatmap_only_train else args.direct_3d_weight,
         consistency_weight=0.0 if heatmap_only_train else args.consistency_weight,
         fusion_delta_weight=0.0 if heatmap_only_train else args.fusion_delta_weight,
+        use_hard_sample_3d_reweight=(not heatmap_only_train) and args.use_hard_sample_3d_reweight,
+        hard_sample_3d_power=args.hard_sample_3d_power,
+        hard_sample_3d_max_weight=args.hard_sample_3d_max_weight,
+        keypoint_3d_weights=keypoint_3d_weights,
     ).to(device)
 
     # Optimizer
@@ -1832,6 +1974,10 @@ def main(args):
         'direct_3d_weight': 0.0 if heatmap_only_train else args.direct_3d_weight,
         'consistency_weight': 0.0 if heatmap_only_train else args.consistency_weight,
         'fusion_delta_weight': 0.0 if heatmap_only_train else args.fusion_delta_weight,
+        'use_hard_sample_3d_reweight': (not heatmap_only_train) and args.use_hard_sample_3d_reweight,
+        'hard_sample_3d_power': args.hard_sample_3d_power,
+        'hard_sample_3d_max_weight': args.hard_sample_3d_max_weight,
+        'keypoint_3d_weights': keypoint_3d_weights,
         'use_iterative_refinement': False,
         'refinement_iterations': 0,
         'refinement_weight': refinement_w,
@@ -1966,6 +2112,14 @@ if __name__ == '__main__':
                         help='Weight for FK/direct 3D consistency')
     parser.add_argument('--fusion-delta-weight', type=float, default=0.1,
                         help='Weight for residual correction regularization')
+    parser.add_argument('--use-hard-sample-3d-reweight', action='store_true', default=False,
+                        help='Enable train-time hard sample reweighting for 3D-related losses')
+    parser.add_argument('--hard-sample-3d-power', type=float, default=1.0,
+                        help='Exponent for hard sample weighting: w=(err/mean_err)^power')
+    parser.add_argument('--hard-sample-3d-max-weight', type=float, default=3.0,
+                        help='Maximum hard sample weight clamp')
+    parser.add_argument('--keypoint-3d-weights', type=str, default='',
+                        help='Comma-separated per-keypoint weights for 3D losses (7 values)')
 
     # Iterative Refinement
     parser.add_argument('--use-iterative-refinement', action='store_true', default=False,

@@ -374,6 +374,8 @@ def compute_pnp_metrics(
 def compute_direct_add_metrics(
     pred_3d_all: np.ndarray,
     gt_3d_all: np.ndarray,
+    gt_2d_all: np.ndarray,
+    image_resolution: Tuple[int, int],
     add_auc_threshold: float = 0.1,
 ) -> Dict:
     """
@@ -383,6 +385,8 @@ def compute_direct_add_metrics(
     Args:
         pred_3d_all: (N_frames, N_kp, 3) predicted 3D keypoints from model
         gt_3d_all: (N_frames, N_kp, 3) ground truth 3D keypoints
+        gt_2d_all: (N_frames, N_kp, 2) ground truth 2D keypoints (raw image coords)
+        image_resolution: (W, H) image resolution used for in-frame filtering
         add_auc_threshold: AUC threshold in meters
 
     Returns:
@@ -393,9 +397,20 @@ def compute_direct_add_metrics(
     frame_adds = []
     per_kp_errors = []
 
-    for pred_3d, gt_3d in zip(pred_3d_all, gt_3d_all):
-        # Valid mask: GT keypoints that are not zero
-        valid = np.any(gt_3d != 0, axis=-1)  # (N_kp,)
+    img_w, img_h = image_resolution
+
+    for pred_3d, gt_3d, gt_2d in zip(pred_3d_all, gt_3d_all, gt_2d_all):
+        # Valid mask:
+        # 1) GT keypoint exists in 2D annotation (not sentinel)
+        # 2) GT 2D keypoint is in-frame (standard benchmark behavior)
+        # 3) GT 3D keypoint is not all-zero
+        has_2d = (gt_2d[:, 0] > -900.0) & (gt_2d[:, 1] > -900.0)
+        in_frame = (
+            (gt_2d[:, 0] >= 0.0) & (gt_2d[:, 0] <= img_w) &
+            (gt_2d[:, 1] >= 0.0) & (gt_2d[:, 1] <= img_h)
+        )
+        has_3d = np.any(gt_3d != 0, axis=-1)
+        valid = has_2d & in_frame & has_3d
         if valid.sum() == 0:
             continue
 
@@ -625,6 +640,8 @@ def run_inference(args):
     all_camera_Ks = []  # Per-sample camera intrinsics
     all_joint_angles_pred = []  # Joint angle predictions (if joint_angle mode)
     all_joint_angles_gt = []  # GT joint angles
+    all_frame_names = []  # json stem per frame
+    all_image_paths = []  # resolved image path per frame
 
     if is_main_process:
         if is_distributed:
@@ -640,6 +657,8 @@ def run_inference(args):
         batch_original_size = batch['original_size'].to(device)  # (B, 2)
         batch_original_size_np = batch_original_size.cpu().numpy()
         gt_angles = batch['angles'].numpy()  # (B, 9)
+        batch_names = batch['name']
+        batch_image_paths = batch['image_path']
 
         # Forward pass (match training-time forward inputs)
         outputs = model(
@@ -683,6 +702,8 @@ def run_inference(args):
             all_pred_3d.append(pred_3d_sample)
             all_camera_Ks.append(sample_camera_K)
             all_joint_angles_gt.append(gt_angles[i])
+            all_frame_names.append(str(batch_names[i]))
+            all_image_paths.append(str(batch_image_paths[i]))
 
             # Count in-frame GT keypoints
             n_inframe = 0
@@ -700,6 +721,8 @@ def run_inference(args):
         'n_inframe': all_n_inframe_projs_gt,
         'angles_gt': all_joint_angles_gt,
         'angles_pred_chunks': all_joint_angles_pred,
+        'frame_names': all_frame_names,
+        'image_paths': all_image_paths,
     }
 
     if is_distributed:
@@ -719,6 +742,8 @@ def run_inference(args):
         all_n_inframe_projs_gt = []
         all_joint_angles_gt = []
         all_joint_angles_pred = []
+        all_frame_names = []
+        all_image_paths = []
         for payload in gathered_payloads:
             if payload is None:
                 continue
@@ -730,6 +755,8 @@ def run_inference(args):
             all_n_inframe_projs_gt.extend(payload['n_inframe'])
             all_joint_angles_gt.extend(payload['angles_gt'])
             all_joint_angles_pred.extend(payload['angles_pred_chunks'])
+            all_frame_names.extend(payload.get('frame_names', []))
+            all_image_paths.extend(payload.get('image_paths', []))
 
     all_kp_projs_detected = np.array(all_kp_projs_detected)
     all_kp_projs_gt = np.array(all_kp_projs_gt)
@@ -756,6 +783,8 @@ def run_inference(args):
     direct_add_metrics = compute_direct_add_metrics(
         all_pred_3d,
         all_kp_pos_gt,
+        all_kp_projs_gt,
+        raw_resolution,
         add_auc_threshold=args.add_auc_threshold
     )
 
@@ -908,6 +937,102 @@ def run_inference(args):
 
         print(f"\nResults saved to {results_path}")
 
+        # Optional: save per-frame 3D error report for outlier analysis
+        if args.save_per_frame_errors:
+            valid_mask = (
+                (all_kp_projs_gt[:, :, 0] > -900.0) & (all_kp_projs_gt[:, :, 1] > -900.0) &
+                (all_kp_projs_gt[:, :, 0] >= 0.0) & (all_kp_projs_gt[:, :, 0] <= raw_resolution[0]) &
+                (all_kp_projs_gt[:, :, 1] >= 0.0) & (all_kp_projs_gt[:, :, 1] <= raw_resolution[1])
+            )
+            per_kp_err = np.linalg.norm(all_pred_3d - all_kp_pos_gt, axis=2)  # (N, num_kp)
+
+            frame_reports = []
+            for i in range(n_samples):
+                valid_i = valid_mask[i]
+                errs_i = per_kp_err[i]
+                valid_errs_i = errs_i[valid_i]
+                if valid_errs_i.size > 0:
+                    mean_err = float(np.mean(valid_errs_i))
+                    median_err = float(np.median(valid_errs_i))
+                    max_err = float(np.max(valid_errs_i))
+                    valid_idx = np.where(valid_i)[0]
+                    worst_local = int(np.argmax(valid_errs_i))
+                    worst_kp_idx = int(valid_idx[worst_local])
+                    worst_kp_name = keypoint_names[worst_kp_idx]
+                else:
+                    mean_err = float('nan')
+                    median_err = float('nan')
+                    max_err = float('nan')
+                    worst_kp_idx = -1
+                    worst_kp_name = None
+
+                per_kp_dict = {}
+                for k_idx, k_name in enumerate(keypoint_names):
+                    per_kp_dict[k_name] = float(errs_i[k_idx]) if valid_i[k_idx] else None
+
+                frame_name = all_frame_names[i] if i < len(all_frame_names) else f"{i:06d}"
+                frame_reports.append({
+                    'frame_index': int(i),
+                    'json_name': frame_name,
+                    'json_path': str(Path(args.dataset_dir) / f"{frame_name}.json"),
+                    'image_path': all_image_paths[i] if i < len(all_image_paths) else None,
+                    'valid_keypoint_count': int(valid_i.sum()),
+                    'mean_3d_error_m': mean_err,
+                    'median_3d_error_m': median_err,
+                    'max_3d_error_m': max_err,
+                    'worst_keypoint_name': worst_kp_name,
+                    'worst_keypoint_index': worst_kp_idx,
+                    'per_keypoint_error_m': per_kp_dict,
+                })
+
+            # Sort by mean error (descending), NaN goes last
+            frame_reports_sorted = sorted(
+                frame_reports,
+                key=lambda x: (np.isnan(x['mean_3d_error_m']), -x['mean_3d_error_m'] if not np.isnan(x['mean_3d_error_m']) else 0.0)
+            )
+
+            topk = max(1, int(args.outlier_topk))
+            topk_reports = frame_reports_sorted[:topk]
+
+            # Per-keypoint summary across valid points
+            kp_summary = {}
+            for k_idx, k_name in enumerate(keypoint_names):
+                kp_valid = valid_mask[:, k_idx]
+                kp_errs = per_kp_err[:, k_idx][kp_valid]
+                if kp_errs.size > 0:
+                    kp_summary[k_name] = {
+                        'count': int(kp_errs.size),
+                        'mean_m': float(np.mean(kp_errs)),
+                        'median_m': float(np.median(kp_errs)),
+                        'p90_m': float(np.percentile(kp_errs, 90)),
+                        'p95_m': float(np.percentile(kp_errs, 95)),
+                        'max_m': float(np.max(kp_errs)),
+                    }
+                else:
+                    kp_summary[k_name] = {
+                        'count': 0,
+                        'mean_m': None,
+                        'median_m': None,
+                        'p90_m': None,
+                        'p95_m': None,
+                        'max_m': None,
+                    }
+
+            per_frame_path = output_dir / 'per_frame_3d_errors.json'
+            outlier_topk_path = output_dir / 'outlier_topk_3d_errors.json'
+            kp_summary_path = output_dir / 'per_keypoint_3d_error_summary.json'
+
+            with open(per_frame_path, 'w') as f:
+                json.dump(frame_reports_sorted, f, indent=2)
+            with open(outlier_topk_path, 'w') as f:
+                json.dump(topk_reports, f, indent=2)
+            with open(kp_summary_path, 'w') as f:
+                json.dump(kp_summary, f, indent=2)
+
+            print(f"Per-frame 3D error report saved to {per_frame_path}")
+            print(f"Top-{topk} outlier report saved to {outlier_topk_path}")
+            print(f"Per-keypoint 3D summary saved to {kp_summary_path}")
+
     if is_distributed:
         cleanup_distributed()
 
@@ -946,6 +1071,10 @@ def main():
     # Output
     parser.add_argument('--output-dir', type=str, default=None,
                         help='Output directory for results')
+    parser.add_argument('--save-per-frame-errors', action='store_true', default=False,
+                        help='Save per-frame 3D error report and top-k outliers')
+    parser.add_argument('--outlier-topk', type=int, default=100,
+                        help='Number of worst frames to save in outlier report')
 
     args = parser.parse_args()
 

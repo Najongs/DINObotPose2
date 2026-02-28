@@ -13,10 +13,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Model checkpoint
 # MODEL_PATH="/home/najo/NAS/DIP/DINObotPose2/Train/outputs/dinov3_base_20260226_161726/best_model.pth"
-MODEL_PATH="/data/public/NAS/DINObotPose2/Train/outputs/dinov3_base_20260228_122201/best_model.pth"
+MODEL_PATH="/data/public/NAS/DINObotPose2/Train/outputs/dinov3_base_20260228_161218/best_model.pth"
 
 # Input annotation JSON (contains image_path + GT keypoints + camera K)
-JSON_PATH="/data/public/NAS/DINObotPose2/Dataset/Converted_dataset/DREAM_to_DREAM/panda-3cam_azure/000000.json"
+JSON_PATH="/data/public/NAS/DINObotPose2/Dataset/Converted_dataset/DREAM_to_DREAM/panda-3cam_azure/002865.json"
 # JSON_PATH="/home/najo/NAS/DIP/2025_ICRA_Multi_View_Robot_Pose_Estimation/dataset/Converted_dataset/DREAM_to_DREAM/panda-3cam_azure/000000.json"
 
 # Output directory
@@ -33,6 +33,11 @@ echo "  Model: ${MODEL_PATH}"
 echo "  JSON:  ${JSON_PATH}"
 echo "  Output: ${OUTPUT_DIR}"
 echo ""
+
+if [[ "${JSON_PATH}" != *.json ]]; then
+    echo "Error: JSON_PATH must point to a .json annotation file, got: ${JSON_PATH}"
+    exit 1
+fi
 
 python "${SCRIPT_DIR}/inference_with_real.py" \
     -j "${JSON_PATH}" \

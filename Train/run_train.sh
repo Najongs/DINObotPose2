@@ -8,7 +8,7 @@
 # =============================================================================
 
 # Data paths (REQUIRED - Update these paths!)
-DATA_DIR="/data/public/NAS/DINObotPose2/Dataset/Converted_dataset/DREAM_to_DREAM"  # Training data directory
+DATA_DIR="/data/public/NAS/DINObotPose2/Dataset/Converted_dataset/DREAM_to_DREAM/panda-3cam_azure"  # Training data directory
 VAL_DIR="/data/public/NAS/DINObotPose2/Dataset/Converted_dataset/DREAM_to_DREAM/panda-3cam_azure"  
 
 # DATA_DIR="/home/najo/NAS/DIP/2025_ICRA_Multi_View_Robot_Pose_Estimation/dataset/Converted_dataset/DREAM_to_DREAM_syn/panda_synth_train_dr"  # Training data directory
@@ -34,6 +34,7 @@ FK_3D_WEIGHT=100.0   # FK 3D keypoint MSE loss weight (robot frame)
 DIRECT_3D_WEIGHT=5.0  # Direct 3D branch supervision weight (robot frame)
 CONSISTENCY_WEIGHT=1.0  # FK/direct consistency weight
 FUSION_DELTA_WEIGHT=0.1  # Residual correction regularization weight
+KEYPOINT_3D_WEIGHTS=""   # e.g. "1.0,1.0,1.0,1.0,1.6,1.8,2.0" for [link0,link2,link3,link4,link6,link7,hand]
 
 # Iterative Refinement (joint_angle mode only)
 USE_ITERATIVE_REFINEMENT=False  # Simplified mode: iterative refinement disabled
@@ -56,12 +57,12 @@ EPOCHS=100
 BATCH_SIZE=16
 NUM_WORKERS=4
 OPTIMIZER="adam"  # Options: adam, adamw, sgd
-LEARNING_RATE=1e-4
-MIN_LR=1e-8
+LEARNING_RATE=5e-4
+MIN_LR=1e-10
 WEIGHT_DECAY=1e-5
 SCHEDULER="cosine"  # Options: step, cosine, plateau, none
 WARMUP_STEPS=200
-WARMUP_START_LR=1e-8
+WARMUP_START_LR=1e-10
 
 # Loss configuration
 LOSS_TYPE="smoothl1"  # Loss function type: mse, l1, smoothl1 (smoothl1 recommended for ADD AUC)
@@ -73,10 +74,10 @@ WANDB_RUN_NAME="dinov3_base_$(date +%Y%m%d_%H%M%S)"
 
 # Other settings
 SEED=42
-RESUME=""  # Path to checkpoint for resuming (leave empty for new training)
+RESUME="/data/public/NAS/DINObotPose2/Train/outputs/*dinov3_base_20260228_143459/*best_model.pth"  # Path to checkpoint for resuming (leave empty for new training)
 RESUME_LR=""  # Learning rate to use when resuming (leave empty for automatic calculation from scheduler)
-LOAD_2D_HEAD="/data/public/NAS/DINObotPose2/Train/outputs/dinov3_base_20260228_013413/epoch_9.pth"  # Path to checkpoint for loading pretrained 2D heatmap head (leave empty to train from scratch)
-FREEZE_2D_HEAD_EPOCHS=10  # If LOAD_2D_HEAD is set, freeze loaded 2D head for first N epochs then unfreeze
+LOAD_2D_HEAD=""  # Path to checkpoint for loading pretrained 2D heatmap head (leave empty to train from scratch)
+FREEZE_2D_HEAD_EPOCHS=60  # If LOAD_2D_HEAD is set, freeze loaded 2D head for first N epochs then unfreeze
 
 # =============================================================================
 # Training Modes
@@ -132,6 +133,7 @@ BASE_CMD="python train.py \
     --direct-3d-weight ${DIRECT_3D_WEIGHT} \
     --consistency-weight ${CONSISTENCY_WEIGHT} \
     --fusion-delta-weight ${FUSION_DELTA_WEIGHT} \
+    $([ -n "${KEYPOINT_3D_WEIGHTS}" ] && echo "--keypoint-3d-weights ${KEYPOINT_3D_WEIGHTS}") \
     ${REFINEMENT_FLAG} \
     --epochs ${EPOCHS} \
     --batch-size ${BATCH_SIZE} \
@@ -219,6 +221,7 @@ elif [ "${TRAIN_MODE}" = "multi_gpu" ]; then
         --direct-3d-weight ${DIRECT_3D_WEIGHT} \
         --consistency-weight ${CONSISTENCY_WEIGHT} \
         --fusion-delta-weight ${FUSION_DELTA_WEIGHT} \
+        $([ -n "${KEYPOINT_3D_WEIGHTS}" ] && echo "--keypoint-3d-weights ${KEYPOINT_3D_WEIGHTS}") \
         ${REFINEMENT_FLAG} \
         --epochs ${EPOCHS} \
         --batch-size ${BATCH_SIZE} \

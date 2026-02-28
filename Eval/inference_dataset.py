@@ -16,7 +16,9 @@ from typing import Dict, List, Tuple
 import numpy as np
 import torch
 import torch.nn.functional as F
+import torch.distributed as dist
 from torch.utils.data import Dataset, DataLoader
+from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
 from PIL import Image
 import torchvision.transforms as transforms
@@ -30,6 +32,32 @@ from dream import analysis as dream_analysis
 # Import model from TRAIN directory
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../Train')))
 from model import DINOv3PoseEstimator
+
+
+def setup_distributed(enable_distributed: bool):
+    """Initialize distributed inference if launched by torchrun."""
+    if not enable_distributed:
+        return False, -1, 1, -1
+
+    if not ('RANK' in os.environ and 'WORLD_SIZE' in os.environ and 'LOCAL_RANK' in os.environ):
+        print("Warning: --distributed set but torchrun env not found. Falling back to single process.")
+        return False, -1, 1, -1
+
+    rank = int(os.environ['RANK'])
+    world_size = int(os.environ['WORLD_SIZE'])
+    local_rank = int(os.environ['LOCAL_RANK'])
+
+    backend = 'nccl' if torch.cuda.is_available() else 'gloo'
+    if torch.cuda.is_available():
+        torch.cuda.set_device(local_rank)
+
+    dist.init_process_group(backend=backend)
+    return True, rank, world_size, local_rank
+
+
+def cleanup_distributed():
+    if dist.is_initialized():
+        dist.destroy_process_group()
 
 
 class InferenceDataset(Dataset):
@@ -206,7 +234,8 @@ def compute_keypoint_metrics(
     kp_detected: np.ndarray,
     kp_gt: np.ndarray,
     image_resolution: Tuple[int, int],
-    auc_threshold: float = 20.0
+    auc_threshold: float = 20.0,
+    pck_thresholds_px: Tuple[float, ...] = (2.5, 5.0, 10.0),
 ) -> Dict:
     """
     Compute keypoint metrics similar to DREAM.
@@ -242,6 +271,10 @@ def compute_keypoint_metrics(
         kp_l2_error_mean = np.mean(kp_l2_errors)
         kp_l2_error_median = np.median(kp_l2_errors)
         kp_l2_error_std = np.std(kp_l2_errors)
+        pck_percentages = {
+            f'pck@{thresh:g}px_percent': float(np.mean(kp_l2_errors <= thresh) * 100.0)
+            for thresh in pck_thresholds_px
+        }
 
         # Compute AUC
         delta_pixel = 0.01
@@ -262,8 +295,11 @@ def compute_keypoint_metrics(
         kp_l2_error_median = None
         kp_l2_error_std = None
         kp_auc = None
+        pck_percentages = {
+            f'pck@{thresh:g}px_percent': None for thresh in pck_thresholds_px
+        }
 
-    return {
+    out = {
         'num_gt_inframe': num_gt_inframe,
         'num_found_gt_inframe': num_found_gt_inframe,
         'l2_error_mean_px': kp_l2_error_mean,
@@ -272,6 +308,8 @@ def compute_keypoint_metrics(
         'l2_error_auc': kp_auc,
         'l2_error_auc_thresh_px': auc_threshold,
     }
+    out.update(pck_percentages)
+    return out
 
 
 def compute_pnp_metrics(
@@ -459,12 +497,15 @@ def load_camera_from_first_frame(dataset_dir: Path) -> Tuple[np.ndarray, Tuple[i
 @torch.no_grad()
 def run_inference(args):
     """Run inference on dataset and compute metrics"""
+    is_distributed, rank, world_size, local_rank = setup_distributed(args.distributed)
+    is_main_process = (not is_distributed) or (rank == 0)
 
     dataset_dir = Path(args.dataset_dir)
     camera_K, raw_resolution = load_camera_from_first_frame(dataset_dir)
 
-    print(f"Camera intrinsics:\n{camera_K}")
-    print(f"Raw resolution: {raw_resolution}")
+    if is_main_process:
+        print(f"Camera intrinsics:\n{camera_K}")
+        print(f"Raw resolution: {raw_resolution}")
 
     # Load training config from checkpoint directory
     checkpoint_dir = Path(args.model_path).parent
@@ -483,21 +524,24 @@ def run_inference(args):
             train_config = yaml.safe_load(f)
         if 'keypoint_names' in train_config:
             keypoint_names = train_config['keypoint_names']
-        print(f"Loaded training config from {config_path}")
-        print(f"  model_name: {train_config.get('model_name', 'N/A')}")
-        print(f"  keypoint_names ({len(keypoint_names)}): {keypoint_names}")
+        if is_main_process:
+            print(f"Loaded training config from {config_path}")
+            print(f"  model_name: {train_config.get('model_name', 'N/A')}")
+            print(f"  keypoint_names ({len(keypoint_names)}): {keypoint_names}")
     else:
-        print(f"Warning: Config not found at {config_path}, using defaults")
+        if is_main_process:
+            print(f"Warning: Config not found at {config_path}, using defaults")
 
     # Resolve config values (CLI args override config.yaml)
     model_name = args.model_name or train_config.get('model_name', 'facebook/dinov3-vitb16-pretrain-lvd1689m')
     image_size = args.image_size or int(train_config.get('image_size', 512))
     heatmap_size = args.heatmap_size or int(train_config.get('heatmap_size', 512))
     use_joint_embedding = train_config.get('use_joint_embedding', False)
-    print(f"  model_name: {model_name}")
-    print(f"  image_size: {image_size}, heatmap_size: {heatmap_size}")
-    print(f"  use_joint_embedding: {use_joint_embedding}")
-    print(f"  mode: joint_angle")
+    if is_main_process:
+        print(f"  model_name: {model_name}")
+        print(f"  image_size: {image_size}, heatmap_size: {heatmap_size}")
+        print(f"  use_joint_embedding: {use_joint_embedding}")
+        print(f"  mode: joint_angle")
 
     # Create dataset
     dataset = InferenceDataset(
@@ -506,17 +550,32 @@ def run_inference(args):
         image_size=(image_size, image_size)
     )
 
+    sampler = None
+    if is_distributed:
+        sampler = DistributedSampler(
+            dataset,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=False,
+            drop_last=False
+        )
+
     dataloader = DataLoader(
         dataset,
         batch_size=args.batch_size,
         shuffle=False,
+        sampler=sampler,
         num_workers=args.num_workers,
         pin_memory=True
     )
 
     # Load model
-    print(f"\nLoading model from {args.model_path}")
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    if is_main_process:
+        print(f"\nLoading model from {args.model_path}")
+    if torch.cuda.is_available():
+        device = torch.device(f'cuda:{local_rank}' if is_distributed else 'cuda')
+    else:
+        device = torch.device('cpu')
 
     use_iterative_refinement = train_config.get('use_iterative_refinement', False)
     refinement_iterations = int(train_config.get('refinement_iterations', 3))
@@ -535,7 +594,8 @@ def run_inference(args):
 
     if 'model_state_dict' in checkpoint:
         state_dict = checkpoint['model_state_dict']
-        print(f"Loaded checkpoint from epoch {checkpoint.get('epoch', 'unknown')}")
+        if is_main_process:
+            print(f"Loaded checkpoint from epoch {checkpoint.get('epoch', 'unknown')}")
     else:
         state_dict = checkpoint
 
@@ -548,7 +608,8 @@ def run_inference(args):
         mask_token_shape = state_dict['backbone.model.embeddings.mask_token'].shape
         if len(mask_token_shape) == 3 and mask_token_shape[1] == 1:
             # Old format: (1, 1, 768) - remove to avoid mismatch
-            print(f"Removing mask_token from state_dict due to shape mismatch (transformers version difference)")
+            if is_main_process:
+                print(f"Removing mask_token from state_dict due to shape mismatch (transformers version difference)")
             del state_dict['backbone.model.embeddings.mask_token']
 
     model.load_state_dict(state_dict, strict=False)
@@ -565,21 +626,24 @@ def run_inference(args):
     all_joint_angles_pred = []  # Joint angle predictions (if joint_angle mode)
     all_joint_angles_gt = []  # GT joint angles
 
-    print(f"\nRunning inference on {len(dataset)} images...")
+    if is_main_process:
+        if is_distributed:
+            print(f"\nRunning distributed inference on {len(dataset)} images with world_size={world_size}...")
+        else:
+            print(f"\nRunning inference on {len(dataset)} images...")
 
-    for batch in tqdm(dataloader):
+    for batch in tqdm(dataloader, disable=not is_main_process):
         images = batch['image'].to(device)
         gt_keypoints = batch['keypoints'].numpy()
         gt_keypoints_3d = batch['keypoints_3d'].numpy()
         batch_camera_K = batch['camera_K'].to(device)  # (B, 3, 3) per-sample K
-        batch_original_size = batch['original_size'].numpy()  # (B, 2)
+        batch_original_size = batch['original_size'].to(device)  # (B, 2)
+        batch_original_size_np = batch_original_size.cpu().numpy()
         gt_angles = batch['angles'].numpy()  # (B, 9)
 
-        # Forward pass (use per-sample camera_K and first sample's original_size)
-        # Note: original_size is typically the same for all samples in a dataset
-        orig_size = tuple(batch_original_size[0].astype(int).tolist())
+        # Forward pass (match training-time forward inputs)
         outputs = model(
-            images, camera_K=batch_camera_K, original_size=orig_size,
+            images, camera_K=batch_camera_K, original_size=batch_original_size,
             use_refinement=use_iterative_refinement
         )
         pred_heatmaps = outputs["heatmaps_2d"]
@@ -594,7 +658,7 @@ def run_inference(args):
 
         for i in range(len(pred_keypoints)):
             # Per-sample raw resolution and camera K
-            sample_raw_w, sample_raw_h = batch_original_size[i].astype(int)
+            sample_raw_w, sample_raw_h = batch_original_size_np[i].astype(int)
             sample_camera_K = batch_camera_K[i].cpu().numpy()
 
             # Scale to raw resolution
@@ -626,6 +690,46 @@ def run_inference(args):
                 if 0 <= kp[0] <= sample_raw_w and 0 <= kp[1] <= sample_raw_h:
                     n_inframe += 1
             all_n_inframe_projs_gt.append(n_inframe)
+
+    local_payload = {
+        'kp_detected': all_kp_projs_detected,
+        'kp_gt': all_kp_projs_gt,
+        'kp3d_gt': all_kp_pos_gt,
+        'pred_3d': all_pred_3d,
+        'camera_Ks': all_camera_Ks,
+        'n_inframe': all_n_inframe_projs_gt,
+        'angles_gt': all_joint_angles_gt,
+        'angles_pred_chunks': all_joint_angles_pred,
+    }
+
+    if is_distributed:
+        gathered_payloads = [None for _ in range(world_size)] if is_main_process else None
+        dist.gather_object(local_payload, gathered_payloads, dst=0)
+        dist.barrier()
+        if not is_main_process:
+            cleanup_distributed()
+            return
+
+        # Merge rank-local payloads on rank 0
+        all_kp_projs_detected = []
+        all_kp_projs_gt = []
+        all_kp_pos_gt = []
+        all_pred_3d = []
+        all_camera_Ks = []
+        all_n_inframe_projs_gt = []
+        all_joint_angles_gt = []
+        all_joint_angles_pred = []
+        for payload in gathered_payloads:
+            if payload is None:
+                continue
+            all_kp_projs_detected.extend(payload['kp_detected'])
+            all_kp_projs_gt.extend(payload['kp_gt'])
+            all_kp_pos_gt.extend(payload['kp3d_gt'])
+            all_pred_3d.extend(payload['pred_3d'])
+            all_camera_Ks.extend(payload['camera_Ks'])
+            all_n_inframe_projs_gt.extend(payload['n_inframe'])
+            all_joint_angles_gt.extend(payload['angles_gt'])
+            all_joint_angles_pred.extend(payload['angles_pred_chunks'])
 
     all_kp_projs_detected = np.array(all_kp_projs_detected)
     all_kp_projs_gt = np.array(all_kp_projs_gt)
@@ -723,6 +827,9 @@ def run_inference(args):
         print(f"#    Mean: {kp_metrics['l2_error_mean_px']:.5f}")
         print(f"#    Median: {kp_metrics['l2_error_median_px']:.5f}")
         print(f"#    Std Dev: {kp_metrics['l2_error_std_px']:.5f}")
+        print(f"#    PCK@2.5px: {kp_metrics['pck@2.5px_percent']:.2f}%")
+        print(f"#    PCK@5px:   {kp_metrics['pck@5px_percent']:.2f}%")
+        print(f"#    PCK@10px:  {kp_metrics['pck@10px_percent']:.2f}%")
     else:
         print("#    No valid keypoints found")
 
@@ -801,6 +908,9 @@ def run_inference(args):
 
         print(f"\nResults saved to {results_path}")
 
+    if is_distributed:
+        cleanup_distributed()
+
 
 def main():
     parser = argparse.ArgumentParser(description='Inference on Dataset with DREAM-style Metrics')
@@ -824,6 +934,8 @@ def main():
                         help='Batch size for inference')
     parser.add_argument('--num-workers', type=int, default=4,
                         help='Number of data loading workers')
+    parser.add_argument('--distributed', action='store_true', default=False,
+                        help='Enable distributed inference (launch with torchrun)')
 
     # Metrics
     parser.add_argument('--kp-auc-threshold', type=float, default=20.0,

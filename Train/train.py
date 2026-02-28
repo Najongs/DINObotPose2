@@ -120,6 +120,9 @@ class UnifiedPoseLoss(nn.Module):
         use_adaptive_weighting: bool = True,  # Use uncertainty-based adaptive weighting
         pnp_failure_penalty_weight: float = 0.1,  # PnP failure penalty weight
         refinement_weight: float = 0.0,  # Iterative refinement loss weight
+        direct_3d_weight: float = 5.0,  # Direct 3D branch supervision weight (robot frame)
+        consistency_weight: float = 1.0,  # FK branch vs direct branch consistency weight
+        fusion_delta_weight: float = 0.1,  # Residual correction regularization weight
     ):
         super().__init__()
         self.heatmap_weight = heatmap_weight
@@ -132,6 +135,9 @@ class UnifiedPoseLoss(nn.Module):
         self.use_adaptive_weighting = use_adaptive_weighting
         self.pnp_failure_penalty_weight = pnp_failure_penalty_weight
         self.refinement_weight = refinement_weight
+        self.direct_3d_weight = direct_3d_weight
+        self.consistency_weight = consistency_weight
+        self.fusion_delta_weight = fusion_delta_weight
 
         # Heatmap loss: 항상 MSE 사용 (값 범위 0~1, Gaussian GT와 MSE가 자연스러움)
         self.heatmap_loss_fn = nn.MSELoss(reduction='none')
@@ -230,6 +236,10 @@ class UnifiedPoseLoss(nn.Module):
                 'kp3d': loss_kp3d.item(),
             }
 
+        gt_kp_robot = None
+        if 'angles' in gt_dict:
+            gt_kp_robot = panda_forward_kinematics(gt_dict['angles'])
+
         # Joint angle loss (joint_angle mode only)
         if self.angle_weight > 0 and 'joint_angles' in pred_dict and 'angles' in gt_dict:
             pred_angles = pred_dict['joint_angles']  # (B, 7)
@@ -239,13 +249,33 @@ class UnifiedPoseLoss(nn.Module):
             loss_dict['angle'] = loss_angle.item()
 
         # FK 3D loss: compare FK(pred_angles) vs FK(gt_angles) in robot frame
-        if self.fk_3d_weight > 0 and 'joint_angles' in pred_dict and 'angles' in gt_dict:
-            pred_kp_robot = pred_dict['keypoints_3d_robot']  # (B, 7, 3) already FK'd
-            gt_angles = gt_dict['angles']  # (B, 7)
-            gt_kp_robot = panda_forward_kinematics(gt_angles)  # (B, 7, 3)
-            loss_fk_3d = self.loss_fn(pred_kp_robot, gt_kp_robot).mean()
+        if self.fk_3d_weight > 0 and 'keypoints_3d_fk' in pred_dict and gt_kp_robot is not None:
+            pred_kp_fk = pred_dict['keypoints_3d_fk']  # (B, 7, 3)
+            loss_fk_3d = self.loss_fn(pred_kp_fk, gt_kp_robot).mean()
             total_loss = total_loss + self.fk_3d_weight * loss_fk_3d
             loss_dict['fk_3d'] = loss_fk_3d.item()
+
+        # Direct 3D branch supervision (robot frame)
+        if self.direct_3d_weight > 0 and 'keypoints_3d_direct' in pred_dict and gt_kp_robot is not None:
+            pred_kp_direct = pred_dict['keypoints_3d_direct']  # (B, 7, 3)
+            loss_direct_3d = self.loss_fn(pred_kp_direct, gt_kp_robot).mean()
+            total_loss = total_loss + self.direct_3d_weight * loss_direct_3d
+            loss_dict['direct_3d'] = loss_direct_3d.item()
+
+        # Cross-branch consistency: FK branch <-> direct branch
+        if self.consistency_weight > 0 and 'keypoints_3d_fk' in pred_dict and 'keypoints_3d_direct' in pred_dict:
+            loss_consistency = self.loss_fn(
+                pred_dict['keypoints_3d_fk'],
+                pred_dict['keypoints_3d_direct']
+            ).mean()
+            total_loss = total_loss + self.consistency_weight * loss_consistency
+            loss_dict['consistency'] = loss_consistency.item()
+
+        # Keep residual correction small unless needed
+        if self.fusion_delta_weight > 0 and 'fusion_delta' in pred_dict:
+            loss_fusion_delta = pred_dict['fusion_delta'].abs().mean()
+            total_loss = total_loss + self.fusion_delta_weight * loss_fusion_delta
+            loss_dict['fusion_delta'] = loss_fusion_delta.item()
 
         # Camera-frame 3D loss: Transform robot-frame to camera-frame using PnP
         if self.camera_3d_weight > 0 and 'joint_angles' in pred_dict and 'keypoints_3d_robot' in pred_dict:
@@ -799,7 +829,15 @@ class Trainer:
         return images, gt_dict, camera_K, orig_size_list, gt_angles, gt_2d_image
 
     # Mapping from loss_dict keys to short display names
-    _LOSS_EXTRA_KEYS = [('angle', 'ang'), ('fk_3d', 'fk'), ('camera_3d', 'cam3d'), ('refinement', 'ref')]
+    _LOSS_EXTRA_KEYS = [
+        ('angle', 'ang'),
+        ('fk_3d', 'fk'),
+        ('direct_3d', 'dir3d'),
+        ('consistency', 'cons'),
+        ('fusion_delta', 'fdlt'),
+        ('camera_3d', 'cam3d'),
+        ('refinement', 'ref'),
+    ]
 
     def _format_postfix(self, loss_dict):
         """loss_dict → tqdm postfix dict"""
@@ -1029,6 +1067,12 @@ class Trainer:
                     postfix['ang'] = f"{loss_dict['angle']:.6f}"
                 if 'fk_3d' in loss_dict:
                     postfix['fk'] = f"{loss_dict['fk_3d']:.6f}"
+                if 'direct_3d' in loss_dict:
+                    postfix['dir3d'] = f"{loss_dict['direct_3d']:.6f}"
+                if 'consistency' in loss_dict:
+                    postfix['cons'] = f"{loss_dict['consistency']:.6f}"
+                if 'fusion_delta' in loss_dict:
+                    postfix['fdlt'] = f"{loss_dict['fusion_delta']:.6f}"
                 if 'camera_3d' in loss_dict:
                     postfix['cam3d'] = f"{loss_dict['camera_3d']:.6f}"
                 if 'refinement' in loss_dict:
@@ -1192,6 +1236,12 @@ class Trainer:
                     train_extra += f", ang: {train_losses['angle']:.6f}"
                 if 'fk_3d' in train_losses:
                     train_extra += f", fk: {train_losses['fk_3d']:.6f}"
+                if 'direct_3d' in train_losses:
+                    train_extra += f", dir3d: {train_losses['direct_3d']:.6f}"
+                if 'consistency' in train_losses:
+                    train_extra += f", cons: {train_losses['consistency']:.6f}"
+                if 'fusion_delta' in train_losses:
+                    train_extra += f", fdlt: {train_losses['fusion_delta']:.6f}"
                 if 'camera_3d' in train_losses:
                     train_extra += f", cam3d: {train_losses['camera_3d']:.6f}"
                 if 'refinement' in train_losses:
@@ -1200,6 +1250,12 @@ class Trainer:
                     val_extra += f", ang: {val_losses['angle']:.6f}"
                 if 'fk_3d' in val_losses:
                     val_extra += f", fk: {val_losses['fk_3d']:.6f}"
+                if 'direct_3d' in val_losses:
+                    val_extra += f", dir3d: {val_losses['direct_3d']:.6f}"
+                if 'consistency' in val_losses:
+                    val_extra += f", cons: {val_losses['consistency']:.6f}"
+                if 'fusion_delta' in val_losses:
+                    val_extra += f", fdlt: {val_losses['fusion_delta']:.6f}"
                 if 'camera_3d' in val_losses:
                     val_extra += f", cam3d: {val_losses['camera_3d']:.6f}"
                 if 'refinement' in val_losses:
@@ -1610,7 +1666,10 @@ def main(args):
             if is_main_process:
                 print(f"Warning: Failed to load camera settings: {e}")
 
-    use_iter_refine = getattr(args, 'use_iterative_refinement', False)
+    # Simplified training mode: iterative refinement is intentionally disabled.
+    if getattr(args, 'use_iterative_refinement', False) and is_main_process:
+        print("Warning: --use-iterative-refinement is ignored in simplified mode.")
+    use_iter_refine = False
     heatmap_only_train = getattr(args, 'heatmap_only_train', False)
     freeze_2d_head_epochs = max(0, int(getattr(args, 'freeze_2d_head_epochs', 0)))
     if freeze_2d_head_epochs > 0 and not args.load_2d_head and is_main_process:
@@ -1619,7 +1678,7 @@ def main(args):
         print("Warning: --heatmap-only-train with --freeze-2d-head-epochs would freeze all trainable branches. Freeze schedule will be ignored.")
     if not args.load_2d_head or heatmap_only_train:
         freeze_2d_head_epochs = 0
-    effective_use_iter_refine = use_iter_refine and not heatmap_only_train
+    effective_use_iter_refine = False
 
     if is_main_process:
         print(f"3D prediction mode: joint_angle")
@@ -1632,7 +1691,7 @@ def main(args):
             f"resume={'yes' if args.resume else 'no'}"
         )
 
-    refine_iters = getattr(args, 'refinement_iterations', 3)
+    refine_iters = 0
 
     model = DINOv3PoseEstimator(
         dino_model_name=args.model_name,
@@ -1647,6 +1706,12 @@ def main(args):
     if heatmap_only_train:
         for p in model.joint_angle_head.parameters():
             p.requires_grad = False
+        if hasattr(model, 'direct_3d_head') and model.direct_3d_head is not None:
+            for p in model.direct_3d_head.parameters():
+                p.requires_grad = False
+        if hasattr(model, 'fusion_head') and model.fusion_head is not None:
+            for p in model.fusion_head.parameters():
+                p.requires_grad = False
         if model.refinement_module is not None:
             for p in model.refinement_module.parameters():
                 p.requires_grad = False
@@ -1657,7 +1722,9 @@ def main(args):
             model,
             device_ids=[local_rank],
             output_device=local_rank,
-            find_unused_parameters=effective_use_iter_refine,  # refinement module may have unused params
+            # This model has conditional branches / optional losses; enable unused-param detection
+            # to avoid reducer errors when some branches are not active on a rank.
+            find_unused_parameters=True,
             broadcast_buffers=True,
             gradient_as_bucket_view=True  # gradient stride 경고 완화
         )
@@ -1685,7 +1752,7 @@ def main(args):
     angle_w = 0.0 if heatmap_only_train else args.angle_weight
     fk_3d_w = 0.0 if heatmap_only_train else args.fk_3d_weight
     camera_3d_w = 0.0 if heatmap_only_train else args.kp3d_weight  # Camera-frame 3D loss
-    refinement_w = 0.0 if heatmap_only_train else (getattr(args, 'refinement_weight', 0.0) if effective_use_iter_refine else 0.0)
+    refinement_w = 0.0
     criterion = UnifiedPoseLoss(
         heatmap_weight=args.heatmap_weight,
         kp3d_weight=0.0,  # Not used in joint_angle mode (use angle/FK/camera_3d losses instead)
@@ -1695,6 +1762,9 @@ def main(args):
         camera_3d_weight=camera_3d_w,  # Camera-frame 3D loss (PnP-based transform)
         loss_type=args.loss_type,  # Loss function type: 'mse', 'l1', 'smoothl1'
         refinement_weight=refinement_w,  # Iterative refinement loss weight
+        direct_3d_weight=0.0 if heatmap_only_train else args.direct_3d_weight,
+        consistency_weight=0.0 if heatmap_only_train else args.consistency_weight,
+        fusion_delta_weight=0.0 if heatmap_only_train else args.fusion_delta_weight,
     ).to(device)
 
     # Optimizer
@@ -1759,8 +1829,11 @@ def main(args):
         'heatmap_only_train': heatmap_only_train,
         'angle_weight': angle_w,
         'fk_3d_weight': fk_3d_w,
-        'use_iterative_refinement': effective_use_iter_refine,
-        'refinement_iterations': refine_iters,
+        'direct_3d_weight': 0.0 if heatmap_only_train else args.direct_3d_weight,
+        'consistency_weight': 0.0 if heatmap_only_train else args.consistency_weight,
+        'fusion_delta_weight': 0.0 if heatmap_only_train else args.fusion_delta_weight,
+        'use_iterative_refinement': False,
+        'refinement_iterations': 0,
         'refinement_weight': refinement_w,
         'batch_size': args.batch_size,
         'epochs': args.epochs,
@@ -1887,6 +1960,12 @@ if __name__ == '__main__':
                         help='Weight for joint angle MSE loss (joint_angle mode)')
     parser.add_argument('--fk-3d-weight', type=float, default=10.0,
                         help='Weight for FK 3D keypoint MSE loss (joint_angle mode)')
+    parser.add_argument('--direct-3d-weight', type=float, default=5.0,
+                        help='Weight for direct 3D branch supervision in robot frame')
+    parser.add_argument('--consistency-weight', type=float, default=1.0,
+                        help='Weight for FK/direct 3D consistency')
+    parser.add_argument('--fusion-delta-weight', type=float, default=0.1,
+                        help='Weight for residual correction regularization')
 
     # Iterative Refinement
     parser.add_argument('--use-iterative-refinement', action='store_true', default=False,

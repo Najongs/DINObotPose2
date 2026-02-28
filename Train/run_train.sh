@@ -8,14 +8,14 @@
 # =============================================================================
 
 # Data paths (REQUIRED - Update these paths!)
-DATA_DIR="/data/public/NAS/DINObotPose2/Dataset/Converted_dataset/DREAM_to_DREAM_syn/panda_synth_train_dr"  # Training data directory
+DATA_DIR="/data/public/NAS/DINObotPose2/Dataset/Converted_dataset/DREAM_to_DREAM"  # Training data directory
 VAL_DIR="/data/public/NAS/DINObotPose2/Dataset/Converted_dataset/DREAM_to_DREAM/panda-3cam_azure"  
 
 # DATA_DIR="/home/najo/NAS/DIP/2025_ICRA_Multi_View_Robot_Pose_Estimation/dataset/Converted_dataset/DREAM_to_DREAM_syn/panda_synth_train_dr"  # Training data directory
 # VAL_DIR="/home/najo/NAS/DIP/2025_ICRA_Multi_View_Robot_Pose_Estimation/dataset/Converted_dataset/DREAM_to_DREAM/panda-3cam_azure"  # Validation data directory (separate from training)
 
 TRAIN_SPLIT=1.0  # Train split ratio (1.0 = use all training data when VAL_DIR is specified)
-VAL_SPLIT=0.5  # Validation data usage ratio (0.1 = use 10% of validation data)
+VAL_SPLIT=0.1  # Validation data usage ratio (0.1 = use 10% of validation data)
 
 # Model configuration
 MODEL_NAME='facebook/dinov3-vitb16-pretrain-lvd1689m'
@@ -31,9 +31,12 @@ USE_JOINT_EMBEDDING=True  # Enable joint identity embeddings in 3D head
 # → angle loss로 자세 추정 → FK_3D로 구조적 일관성 강제 순서로 학습
 ANGLE_WEIGHT=10.0    # Joint angle MSE loss weight
 FK_3D_WEIGHT=100.0   # FK 3D keypoint MSE loss weight (robot frame)
+DIRECT_3D_WEIGHT=5.0  # Direct 3D branch supervision weight (robot frame)
+CONSISTENCY_WEIGHT=1.0  # FK/direct consistency weight
+FUSION_DELTA_WEIGHT=0.1  # Residual correction regularization weight
 
 # Iterative Refinement (joint_angle mode only)
-USE_ITERATIVE_REFINEMENT=True  # Enable render-and-compare refinement loop
+USE_ITERATIVE_REFINEMENT=False  # Simplified mode: iterative refinement disabled
 REFINEMENT_ITERATIONS=3        # Number of refinement iterations
 REFINEMENT_WEIGHT=50.0         # Refinement loss weight
 
@@ -46,7 +49,7 @@ HEATMAP_ONLY_TRAIN=False  # True: train only 2D heatmap branch
 FDA_REAL_DIR="/data/public/NAS/DINObotPose2/Dataset/DREAM_real"  # Real images (no labels needed)
 # FDA_REAL_DIR="/home/najo/NAS/DIP/2025_ICRA_Multi_View_Robot_Pose_Estimation/dataset/DREAM_real"
 FDA_BETA=0.001   # Low-freq replacement ratio (0.01=subtle tone shift, 0.05=strong)
-FDA_PROB=0.5    # Probability of applying FDA per sample (0.0 to disable)
+FDA_PROB=0.0    # Probability of applying FDA per sample (0.0 to disable)
 
 # Training hyperparameters
 EPOCHS=100
@@ -73,7 +76,7 @@ SEED=42
 RESUME=""  # Path to checkpoint for resuming (leave empty for new training)
 RESUME_LR=""  # Learning rate to use when resuming (leave empty for automatic calculation from scheduler)
 LOAD_2D_HEAD="/data/public/NAS/DINObotPose2/Train/outputs/dinov3_base_20260228_013413/epoch_9.pth"  # Path to checkpoint for loading pretrained 2D heatmap head (leave empty to train from scratch)
-FREEZE_2D_HEAD_EPOCHS=3  # If LOAD_2D_HEAD is set, freeze loaded 2D head for first N epochs then unfreeze
+FREEZE_2D_HEAD_EPOCHS=10  # If LOAD_2D_HEAD is set, freeze loaded 2D head for first N epochs then unfreeze
 
 # =============================================================================
 # Training Modes
@@ -126,6 +129,9 @@ BASE_CMD="python train.py \
     ${HEATMAP_ONLY_FLAG} \
     --angle-weight ${ANGLE_WEIGHT} \
     --fk-3d-weight ${FK_3D_WEIGHT} \
+    --direct-3d-weight ${DIRECT_3D_WEIGHT} \
+    --consistency-weight ${CONSISTENCY_WEIGHT} \
+    --fusion-delta-weight ${FUSION_DELTA_WEIGHT} \
     ${REFINEMENT_FLAG} \
     --epochs ${EPOCHS} \
     --batch-size ${BATCH_SIZE} \
@@ -210,6 +216,9 @@ elif [ "${TRAIN_MODE}" = "multi_gpu" ]; then
         ${HEATMAP_ONLY_FLAG} \
         --angle-weight ${ANGLE_WEIGHT} \
         --fk-3d-weight ${FK_3D_WEIGHT} \
+        --direct-3d-weight ${DIRECT_3D_WEIGHT} \
+        --consistency-weight ${CONSISTENCY_WEIGHT} \
+        --fusion-delta-weight ${FUSION_DELTA_WEIGHT} \
         ${REFINEMENT_FLAG} \
         --epochs ${EPOCHS} \
         --batch-size ${BATCH_SIZE} \

@@ -285,10 +285,13 @@ def network_inference(args):
     camera_K_tensor = None
     if camera_K is not None:
         camera_K_tensor = torch.tensor(camera_K, dtype=torch.float32).unsqueeze(0).to(device)
+    original_size_tensor = torch.tensor(
+        [[orig_dim[0], orig_dim[1]]], dtype=torch.float32, device=device
+    )
 
     with torch.no_grad():
         outputs = model(
-            image_tensor, camera_K=camera_K_tensor, original_size=orig_dim,
+            image_tensor, camera_K=camera_K_tensor, original_size=original_size_tensor,
             use_refinement=use_iterative_refinement
         )
         pred_heatmaps = outputs["heatmaps_2d"]

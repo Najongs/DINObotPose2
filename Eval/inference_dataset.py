@@ -2,7 +2,7 @@
 Dataset Inference Script for DINOv3 Pose Estimation
 Evaluates a trained model on a dataset with metrics:
 - L2 error (px) for in-frame keypoints with AUC
-- ADD (m) from model's 3D head: pred_3d vs GT_3d direct comparison
+- ADD (m) from selected 3D source (fk/fused), transformed to camera frame
 - ADD (m) from PnP baseline (DREAM-style): 2D pred + GT_3d + K -> PnP -> ADD
 """
 
@@ -31,7 +31,23 @@ from dream import analysis as dream_analysis
 
 # Import model from TRAIN directory
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../Train')))
-from model import DINOv3PoseEstimator
+from model import DINOv3PoseEstimator, panda_forward_kinematics
+
+
+def _ensure_panda_angles_7(joint_angles_tensor: torch.Tensor, fix_joint7_zero: bool = False) -> torch.Tensor:
+    """Convert predicted joint angles (6/7 DoF) to 7-DoF Panda vector for FK."""
+    if joint_angles_tensor.shape[1] >= 7:
+        angles7 = joint_angles_tensor[:, :7].clone()
+    else:
+        pad = torch.zeros(
+            (joint_angles_tensor.shape[0], 7 - joint_angles_tensor.shape[1]),
+            device=joint_angles_tensor.device,
+            dtype=joint_angles_tensor.dtype,
+        )
+        angles7 = torch.cat([joint_angles_tensor, pad], dim=1)
+    if fix_joint7_zero and angles7.shape[1] >= 7:
+        angles7[:, 6] = 0.0
+    return angles7
 
 
 def setup_distributed(enable_distributed: bool):
@@ -162,7 +178,9 @@ class InferenceDataset(Dataset):
         }
 
 
-def get_keypoints_from_heatmaps(heatmaps: torch.Tensor) -> np.ndarray:
+def get_keypoints_from_heatmaps(
+    heatmaps: torch.Tensor, min_confidence: float = 0.0, min_peak_logit: float = -1e9
+) -> Tuple[np.ndarray, np.ndarray]:
     """
     Extract keypoint coordinates from heatmaps using argmax.
 
@@ -170,7 +188,8 @@ def get_keypoints_from_heatmaps(heatmaps: torch.Tensor) -> np.ndarray:
         heatmaps: (B, N, H, W) tensor
 
     Returns:
-        keypoints: (B, N, 2) numpy array [x, y]
+        keypoints: (B, N, 2) numpy array [x, y], low-confidence points as -999
+        confidences: (B, N) numpy array in [0, 1]
     """
     B, N, H, W = heatmaps.shape
     heatmaps_flat = heatmaps.view(B, N, -1)
@@ -180,7 +199,34 @@ def get_keypoints_from_heatmaps(heatmaps: torch.Tensor) -> np.ndarray:
     x = max_indices % W
 
     keypoints = torch.stack([x, y], dim=-1).float()
-    return keypoints.cpu().numpy()
+    confidences = torch.sigmoid(heatmaps_flat.amax(dim=-1))
+
+    peak_logits = heatmaps_flat.amax(dim=-1)
+    invalid = torch.zeros_like(confidences, dtype=torch.bool)
+    if min_confidence > 0.0:
+        invalid = invalid | (confidences < float(min_confidence))
+    if min_peak_logit is not None:
+        invalid = invalid | (peak_logits < float(min_peak_logit))
+    if invalid.any():
+        keypoints = keypoints.masked_fill(invalid.unsqueeze(-1), -999.0)
+
+    return keypoints.cpu().numpy(), confidences.cpu().numpy()
+
+
+def passes_pnp_spread_check(points_2d: np.ndarray, image_resolution: Tuple[int, int], min_span_px: float, min_area_ratio: float) -> bool:
+    """Reject degenerate PnP point sets that are too concentrated in image space."""
+    if points_2d.shape[0] < 4:
+        return False
+    x_span = float(np.max(points_2d[:, 0]) - np.min(points_2d[:, 0]))
+    y_span = float(np.max(points_2d[:, 1]) - np.min(points_2d[:, 1]))
+    bbox_area = max(0.0, x_span) * max(0.0, y_span)
+    img_area = max(1.0, float(image_resolution[0] * image_resolution[1]))
+    area_ratio = bbox_area / img_area
+    return bool(
+        (x_span >= float(min_span_px))
+        and (y_span >= float(min_span_px))
+        and (area_ratio >= float(min_area_ratio))
+    )
 
 
 def transform_robot_to_camera(robot_kpts, pred_2d, camera_K):
@@ -194,11 +240,19 @@ def transform_robot_to_camera(robot_kpts, pred_2d, camera_K):
 
     Returns:
         camera_kpts: (N, 3) keypoints in camera frame (or None if PnP fails)
+        proj_2d_all: (N, 2) reprojection of all robot points with solved pose (or None)
     """
     try:
-        # EPnP requires at least 4 points
-        if len(robot_kpts) < 4:
-            return None
+        valid = (
+            np.isfinite(robot_kpts).all(axis=1)
+            & np.isfinite(pred_2d).all(axis=1)
+            & (pred_2d[:, 0] > -900.0)
+            & (pred_2d[:, 1] > -900.0)
+        )
+        if np.count_nonzero(valid) < 4:
+            return None, None
+        robot_kpts_valid = robot_kpts[valid]
+        pred_2d_valid = pred_2d[valid]
 
         # Ensure correct data types
         robot_kpts = robot_kpts.astype(np.float64)
@@ -207,27 +261,28 @@ def transform_robot_to_camera(robot_kpts, pred_2d, camera_K):
 
         # Solve PnP with EPnP algorithm
         success, rvec, tvec = cv2.solvePnP(
-            robot_kpts,
-            pred_2d,
+            robot_kpts_valid,
+            pred_2d_valid,
             camera_K,
             None,  # No distortion
             flags=cv2.SOLVEPNP_EPNP  # Use EPnP algorithm
         )
 
         if not success:
-            return None
+            return None, None
 
         # Convert rotation vector to rotation matrix
         R, _ = cv2.Rodrigues(rvec)
         t = tvec.flatten()
 
-        # Transform: camera_frame = R @ robot_frame + t
+        # Transform all robot-frame keypoints with estimated pose so output shape stays (N, 3).
         camera_kpts = (R @ robot_kpts.T).T + t.reshape(1, 3)
+        proj_all, _ = cv2.projectPoints(robot_kpts.astype(np.float64), rvec, tvec, camera_K, None)
 
-        return camera_kpts
+        return camera_kpts, proj_all.reshape(-1, 2)
 
     except Exception as e:
-        return None
+        return None, None
 
 
 def compute_keypoint_metrics(
@@ -339,9 +394,14 @@ def compute_pnp_metrics(
     add_pnp_found = pnp_add[idx_pnp_found]
     num_pnp_found = len(idx_pnp_found)
 
-    mean_add = np.mean(add_pnp_found)
-    median_add = np.median(add_pnp_found)
-    std_add = np.std(add_pnp_found)
+    if num_pnp_found > 0:
+        mean_add = np.mean(add_pnp_found)
+        median_add = np.median(add_pnp_found)
+        std_add = np.std(add_pnp_found)
+    else:
+        mean_add = None
+        median_add = None
+        std_add = None
 
     num_pnp_possible = len(
         np.where(num_inframe_projs_gt >= num_min_inframe_projs_gt_for_pnp)[0]
@@ -351,14 +411,16 @@ def compute_pnp_metrics(
     delta_threshold = 0.00001
     add_threshold_values = np.arange(0.0, add_auc_threshold, delta_threshold)
 
-    counts = []
-    for value in add_threshold_values:
-        under_threshold = len(np.where(add_pnp_found <= value)[0]) / float(
-            num_pnp_possible
-        )
-        counts.append(under_threshold)
-
-    auc = np.trapz(counts, dx=delta_threshold) / float(add_auc_threshold)
+    if num_pnp_possible > 0:
+        counts = []
+        for value in add_threshold_values:
+            under_threshold = len(np.where(add_pnp_found <= value)[0]) / float(
+                num_pnp_possible
+            )
+            counts.append(under_threshold)
+        auc = np.trapz(counts, dx=delta_threshold) / float(add_auc_threshold)
+    else:
+        auc = None
 
     return {
         'num_pnp_found': num_pnp_found,
@@ -462,6 +524,90 @@ def compute_direct_add_metrics(
     }
 
 
+def compute_robopepp_style_pnp_add_metrics(
+    pred_2d_all: np.ndarray,
+    pred_3d_robot_all: np.ndarray,
+    gt_3d_all: np.ndarray,
+    gt_2d_all: np.ndarray,
+    camera_Ks: np.ndarray,
+    image_resolution: Tuple[int, int],
+    num_inframe_projs_gt: List[int],
+    pred_conf_all: np.ndarray,
+    add_auc_threshold: float = 0.1,
+    pnp_magic_number: float = -999.0,
+    min_points: int = 4,
+    init_conf_thresh: float = 0.25,
+    conf_step: float = 0.025,
+    pnp_min_span_px: float = 20.0,
+    pnp_min_area_ratio: float = 0.001,
+) -> Dict:
+    """
+    RoboPEPP-style PnP ADD:
+    pred_2d + pred_robot_3d(FK/source) + K -> PnP -> camera-frame pred_3d -> ADD vs GT camera 3D.
+    """
+    pnp_adds = []
+    raw_w, raw_h = image_resolution
+
+    for pred_2d, pred_3d_robot, gt_3d, gt_2d, sample_K, kp_conf in zip(
+        pred_2d_all, pred_3d_robot_all, gt_3d_all, gt_2d_all, camera_Ks, pred_conf_all
+    ):
+        valid_pred2d = np.isfinite(pred_2d).all(axis=1) & (pred_2d[:, 0] > -999.0) & (pred_2d[:, 1] > -999.0)
+        in_frame_gt2d = (
+            np.isfinite(gt_2d).all(axis=1) &
+            (gt_2d[:, 0] >= 0.0) & (gt_2d[:, 0] <= raw_w) &
+            (gt_2d[:, 1] >= 0.0) & (gt_2d[:, 1] <= raw_h)
+        )
+        valid_gt3d = np.isfinite(gt_3d).all(axis=1) & (np.linalg.norm(gt_3d, axis=1) > 1e-8)
+        base_valid = valid_pred2d & in_frame_gt2d & valid_gt3d
+
+        thresh = init_conf_thresh
+        idx = np.where(base_valid & (kp_conf > thresh))[0]
+        while idx.shape[0] < min_points and thresh > -1.0:
+            thresh -= conf_step
+            idx = np.where(base_valid & (kp_conf > thresh))[0]
+        if idx.shape[0] < min_points:
+            idx = np.where(base_valid)[0]
+        if idx.shape[0] < min_points:
+            pnp_adds.append(pnp_magic_number)
+            continue
+        if not passes_pnp_spread_check(pred_2d[idx], image_resolution, pnp_min_span_px, pnp_min_area_ratio):
+            pnp_adds.append(pnp_magic_number)
+            continue
+
+        try:
+            success, rvec, tvec = cv2.solvePnP(
+                pred_3d_robot[idx].astype(np.float64),
+                pred_2d[idx].astype(np.float64),
+                sample_K.astype(np.float64),
+                None,
+                flags=cv2.SOLVEPNP_EPNP,
+            )
+            if not success:
+                pnp_adds.append(pnp_magic_number)
+                continue
+
+            R, _ = cv2.Rodrigues(rvec)
+            t = tvec.flatten()
+            pred_3d_cam = (R @ pred_3d_robot.T).T + t.reshape(1, 3)
+
+            eval_mask = in_frame_gt2d & valid_gt3d
+            if np.count_nonzero(eval_mask) == 0:
+                pnp_adds.append(pnp_magic_number)
+                continue
+
+            add = float(np.linalg.norm(pred_3d_cam[eval_mask] - gt_3d[eval_mask], axis=1).mean())
+            pnp_adds.append(add)
+        except Exception:
+            pnp_adds.append(pnp_magic_number)
+
+    return compute_pnp_metrics(
+        pnp_add=pnp_adds,
+        num_inframe_projs_gt=num_inframe_projs_gt,
+        add_auc_threshold=add_auc_threshold,
+        pnp_magic_number=pnp_magic_number,
+    )
+
+
 def load_camera_from_first_frame(dataset_dir: Path) -> Tuple[np.ndarray, Tuple[int, int]]:
     """
     Load camera intrinsics K and raw image resolution (W,H) from the first frame json.
@@ -552,10 +698,12 @@ def run_inference(args):
     image_size = args.image_size or int(train_config.get('image_size', 512))
     heatmap_size = args.heatmap_size or int(train_config.get('heatmap_size', 512))
     use_joint_embedding = train_config.get('use_joint_embedding', False)
+    fix_joint7_zero = args.fix_joint7_zero or bool(train_config.get('fix_joint7_zero', False))
     if is_main_process:
         print(f"  model_name: {model_name}")
         print(f"  image_size: {image_size}, heatmap_size: {heatmap_size}")
         print(f"  use_joint_embedding: {use_joint_embedding}")
+        print(f"  fix_joint7_zero: {fix_joint7_zero}")
         print(f"  mode: joint_angle")
 
     # Create dataset
@@ -602,6 +750,7 @@ def run_inference(args):
         use_joint_embedding=use_joint_embedding,
         use_iterative_refinement=use_iterative_refinement,
         refinement_iterations=refinement_iterations,
+        fix_joint7_zero=fix_joint7_zero,
     ).to(device)
 
     # Load checkpoint
@@ -627,7 +776,19 @@ def run_inference(args):
                 print(f"Removing mask_token from state_dict due to shape mismatch (transformers version difference)")
             del state_dict['backbone.model.embeddings.mask_token']
 
-    model.load_state_dict(state_dict, strict=False)
+    # Drop shape-mismatched keys (e.g., switching joint-angle head 7->6 outputs).
+    model_state = model.state_dict()
+    filtered_state = {}
+    dropped = []
+    for k, v in state_dict.items():
+        if k in model_state and model_state[k].shape == v.shape:
+            filtered_state[k] = v
+        elif k in model_state:
+            dropped.append(k)
+    if is_main_process and dropped:
+        print(f"Dropping {len(dropped)} mismatched checkpoint keys (shape mismatch)")
+
+    model.load_state_dict(filtered_state, strict=False)
 
     model.eval()
 
@@ -637,6 +798,8 @@ def run_inference(args):
     all_kp_pos_gt = []
     all_n_inframe_projs_gt = []
     all_pred_3d = []  # Model's direct 3D predictions
+    all_pred_3d_robot = []  # Model robot-frame 3D source (before PnP)
+    all_pred_kp_conf = []  # Per-keypoint heatmap confidence (max over HxW)
     all_camera_Ks = []  # Per-sample camera intrinsics
     all_joint_angles_pred = []  # Joint angle predictions (if joint_angle mode)
     all_joint_angles_gt = []  # GT joint angles
@@ -657,6 +820,9 @@ def run_inference(args):
         batch_original_size = batch['original_size'].to(device)  # (B, 2)
         batch_original_size_np = batch_original_size.cpu().numpy()
         gt_angles = batch['angles'].numpy()  # (B, 9)
+        if fix_joint7_zero and gt_angles.shape[1] >= 7:
+            gt_angles = gt_angles.copy()
+            gt_angles[:, 6] = 0.0
         batch_names = batch['name']
         batch_image_paths = batch['image_path']
 
@@ -666,14 +832,31 @@ def run_inference(args):
             use_refinement=use_iterative_refinement
         )
         pred_heatmaps = outputs["heatmaps_2d"]
-        pred_kpts_3d = outputs["keypoints_3d"].cpu().numpy()  # (B, N_kp, 3)
+        # Select robot-frame 3D source before camera-frame PnP transform.
+        if args.pred_3d_source == 'fk':
+            if fix_joint7_zero and "joint_angles" in outputs and outputs["joint_angles"] is not None:
+                joint_angles_fk = _ensure_panda_angles_7(outputs["joint_angles"], fix_joint7_zero=True)
+                pred_kpts_3d_tensor = panda_forward_kinematics(joint_angles_fk)
+            else:
+                pred_kpts_3d_tensor = outputs["keypoints_3d_fk"] if "keypoints_3d_fk" in outputs else outputs["keypoints_3d"]
+        else:  # fused
+            pred_kpts_3d_tensor = outputs["keypoints_3d"]
+        pred_kpts_3d = pred_kpts_3d_tensor.cpu().numpy()  # (B, N_kp, 3)
 
         # Collect joint angles if available
         if "joint_angles" in outputs and outputs["joint_angles"] is not None:
-            all_joint_angles_pred.append(outputs["joint_angles"].cpu().numpy())
+            pred_angles = outputs["joint_angles"]
+            if fix_joint7_zero and pred_angles.shape[1] >= 7:
+                pred_angles = pred_angles.clone()
+                pred_angles[:, 6] = 0.0
+            all_joint_angles_pred.append(pred_angles.cpu().numpy())
 
         # Extract keypoints from heatmaps
-        pred_keypoints = get_keypoints_from_heatmaps(pred_heatmaps)
+        pred_keypoints, pred_kp_conf = get_keypoints_from_heatmaps(
+            pred_heatmaps,
+            min_confidence=args.kp_min_confidence,
+            min_peak_logit=args.kp_min_peak_logit,
+        )
 
         for i in range(len(pred_keypoints)):
             # Per-sample raw resolution and camera K
@@ -690,16 +873,36 @@ def run_inference(args):
             pred_kp_scaled[:, 1] *= scale_y
 
             # Transform 3D predictions from robot frame to camera frame via PnP
-            pred_3d_sample = pred_kpts_3d[i]
+            pred_3d_robot_sample = pred_kpts_3d[i]
+            pred_3d_sample = pred_3d_robot_sample
             if sample_camera_K is not None:
-                pred_3d_camera = transform_robot_to_camera(pred_3d_sample, pred_kp_scaled, sample_camera_K)
+                valid_for_pnp = np.isfinite(pred_kp_scaled).all(axis=1) & (pred_kp_scaled[:, 0] > -900.0) & (pred_kp_scaled[:, 1] > -900.0)
+                if np.count_nonzero(valid_for_pnp) >= 4 and (
+                    not passes_pnp_spread_check(
+                        pred_kp_scaled[valid_for_pnp],
+                        (sample_raw_w, sample_raw_h),
+                        args.pnp_min_span_px,
+                        args.pnp_min_area_ratio,
+                    )
+                ):
+                    pred_3d_camera, proj_2d_all = None, None
+                else:
+                    pred_3d_camera, proj_2d_all = transform_robot_to_camera(pred_3d_robot_sample, pred_kp_scaled, sample_camera_K)
                 if pred_3d_camera is not None:
                     pred_3d_sample = pred_3d_camera
+                    if args.fill_invalid_2d_with_fk_reproj and proj_2d_all is not None:
+                        low_conf_mask = pred_kp_conf[i] < float(args.kp_min_confidence)
+                        low_reliability = low_conf_mask
+                        valid_pred = np.isfinite(pred_kp_scaled).all(axis=1) & (pred_kp_scaled[:, 0] > -900.0) & (pred_kp_scaled[:, 1] > -900.0)
+                        fill_mask = (~valid_pred) | low_reliability
+                        pred_kp_scaled[fill_mask] = proj_2d_all[fill_mask]
 
             all_kp_projs_detected.append(pred_kp_scaled)
             all_kp_projs_gt.append(gt_keypoints[i])
             all_kp_pos_gt.append(gt_keypoints_3d[i])
             all_pred_3d.append(pred_3d_sample)
+            all_pred_3d_robot.append(pred_3d_robot_sample)
+            all_pred_kp_conf.append(pred_kp_conf[i])
             all_camera_Ks.append(sample_camera_K)
             all_joint_angles_gt.append(gt_angles[i])
             all_frame_names.append(str(batch_names[i]))
@@ -717,6 +920,8 @@ def run_inference(args):
         'kp_gt': all_kp_projs_gt,
         'kp3d_gt': all_kp_pos_gt,
         'pred_3d': all_pred_3d,
+        'pred_3d_robot': all_pred_3d_robot,
+        'pred_kp_conf': all_pred_kp_conf,
         'camera_Ks': all_camera_Ks,
         'n_inframe': all_n_inframe_projs_gt,
         'angles_gt': all_joint_angles_gt,
@@ -738,6 +943,8 @@ def run_inference(args):
         all_kp_projs_gt = []
         all_kp_pos_gt = []
         all_pred_3d = []
+        all_pred_3d_robot = []
+        all_pred_kp_conf = []
         all_camera_Ks = []
         all_n_inframe_projs_gt = []
         all_joint_angles_gt = []
@@ -751,6 +958,8 @@ def run_inference(args):
             all_kp_projs_gt.extend(payload['kp_gt'])
             all_kp_pos_gt.extend(payload['kp3d_gt'])
             all_pred_3d.extend(payload['pred_3d'])
+            all_pred_3d_robot.extend(payload.get('pred_3d_robot', []))
+            all_pred_kp_conf.extend(payload.get('pred_kp_conf', []))
             all_camera_Ks.extend(payload['camera_Ks'])
             all_n_inframe_projs_gt.extend(payload['n_inframe'])
             all_joint_angles_gt.extend(payload['angles_gt'])
@@ -762,6 +971,8 @@ def run_inference(args):
     all_kp_projs_gt = np.array(all_kp_projs_gt)
     all_kp_pos_gt = np.array(all_kp_pos_gt)
     all_pred_3d = np.array(all_pred_3d)
+    all_pred_3d_robot = np.array(all_pred_3d_robot)
+    all_pred_kp_conf = np.array(all_pred_kp_conf)
     all_joint_angles_gt = np.array(all_joint_angles_gt)
     if all_joint_angles_pred:
         all_joint_angles_pred = np.concatenate(all_joint_angles_pred, axis=0)
@@ -778,8 +989,8 @@ def run_inference(args):
         auc_threshold=args.kp_auc_threshold
     )
 
-    # ===== Direct ADD: model's 3D head output vs GT 3D =====
-    print("Computing Direct ADD metrics (model 3D head vs GT 3D)...")
+    # ===== Direct ADD: selected 3D source output vs GT 3D =====
+    print(f"Computing Direct ADD metrics ({args.pred_3d_source} source vs GT 3D)...")
     direct_add_metrics = compute_direct_add_metrics(
         all_pred_3d,
         all_kp_pos_gt,
@@ -792,37 +1003,44 @@ def run_inference(args):
     print("Computing PnP ADD metrics (DREAM baseline)...")
     pnp_adds = []
 
-    from scipy.spatial.transform import Rotation
-
     for kp_det, kp_gt, kp_3d, n_inframe, sample_K in tqdm(
         zip(all_kp_projs_detected, all_kp_projs_gt, all_kp_pos_gt, all_n_inframe_projs_gt, all_camera_Ks),
         total=len(all_kp_projs_detected),
         desc="PnP solving"
     ):
-        # Filter valid detections
-        idx_good = np.where((kp_det[:, 0] > -999.0) & (kp_det[:, 1] > -999.0))[0]
+        # DREAM-style filtering:
+        # - valid predicted 2D
+        # - GT keypoint in frame
+        # - GT 3D not missing (not all zeros)
+        valid_pred2d = np.isfinite(kp_det).all(axis=1) & (kp_det[:, 0] > -999.0) & (kp_det[:, 1] > -999.0)
+        in_frame_gt2d = (
+            np.isfinite(kp_gt).all(axis=1) &
+            (kp_gt[:, 0] >= 0.0) & (kp_gt[:, 0] <= raw_resolution[0]) &
+            (kp_gt[:, 1] >= 0.0) & (kp_gt[:, 1] <= raw_resolution[1])
+        )
+        valid_gt3d = np.isfinite(kp_3d).all(axis=1) & (np.linalg.norm(kp_3d, axis=1) > 1e-8)
+        idx_good = np.where(valid_pred2d & in_frame_gt2d & valid_gt3d)[0]
 
         if len(idx_good) >= 4:  # Need at least 4 points for PnP
             kp_det_pnp = kp_det[idx_good]
             kp_3d_pnp = kp_3d[idx_good]
+            if not passes_pnp_spread_check(
+                kp_det_pnp, raw_resolution, args.pnp_min_span_px, args.pnp_min_area_ratio
+            ):
+                pnp_adds.append(-999.0)
+                continue
 
-            # Solve PnP using EPnP with per-sample camera K
+            # Solve PnP using DREAM wrapper (EPnP + optional refinement).
             try:
-                success, rvec, tvec = cv2.solvePnP(
+                success, translation, quaternion = dream.geometric_vision.solve_pnp(
                     kp_3d_pnp.astype(np.float64),
                     kp_det_pnp.astype(np.float64),
                     sample_K.astype(np.float64),
-                    None,  # No distortion
-                    flags=cv2.SOLVEPNP_EPNP
                 )
 
                 if success:
-                    R, _ = cv2.Rodrigues(rvec)
-                    t = tvec.flatten()
-                    quaternion = Rotation.from_matrix(R).as_quat()  # [x, y, z, w]
-
                     add = dream.geometric_vision.add_from_pose(
-                        t, quaternion, kp_3d_pnp, sample_K
+                        translation, quaternion, kp_3d_pnp, sample_K
                     )
                     pnp_adds.append(add)
                 else:
@@ -838,6 +1056,24 @@ def run_inference(args):
         add_auc_threshold=args.add_auc_threshold
     )
 
+    # ===== RoboPEPP-style PnP ADD: pred 2D + pred robot 3D + K =====
+    print("Computing RoboPEPP-style PnP ADD metrics (pred 2D + pred robot 3D + K)...")
+    robopepp_pnp_metrics = compute_robopepp_style_pnp_add_metrics(
+        pred_2d_all=all_kp_projs_detected,
+        pred_3d_robot_all=all_pred_3d_robot,
+        gt_3d_all=all_kp_pos_gt,
+        gt_2d_all=all_kp_projs_gt,
+        camera_Ks=np.array(all_camera_Ks),
+        image_resolution=raw_resolution,
+        num_inframe_projs_gt=all_n_inframe_projs_gt,
+        pred_conf_all=all_pred_kp_conf,
+        add_auc_threshold=args.add_auc_threshold,
+        init_conf_thresh=args.robopepp_pnp_init_thresh,
+        conf_step=args.robopepp_pnp_conf_step,
+        pnp_min_span_px=args.pnp_min_span_px,
+        pnp_min_area_ratio=args.pnp_min_area_ratio,
+    )
+
     # Print results
     print("\n" + "=" * 80)
     print("EVALUATION RESULTS")
@@ -845,7 +1081,7 @@ def run_inference(args):
 
     print(f"\nDataset: {args.dataset_dir}")
     print(f"Model: {args.model_path}")
-    print(f"3D Prediction Mode: joint_angle (Robot frame → Camera frame via PnP)")
+    print(f"3D Prediction Mode: joint_angle/{args.pred_3d_source} (robot-frame FK/source -> camera-frame via PnP)")
     print(f"Number of frames: {n_samples}")
 
     # 2D Keypoint metrics
@@ -862,8 +1098,8 @@ def run_inference(args):
     else:
         print("#    No valid keypoints found")
 
-    # Direct ADD (model's 3D head)
-    print(f"\n# Direct ADD (m) - Model 3D head vs GT 3D (n = {direct_add_metrics['num_frames']}):")
+    # Direct ADD (selected 3D source)
+    print(f"\n# Direct ADD (m, camera-frame) - {args.pred_3d_source} source (robot->camera transformed) vs GT 3D (n = {direct_add_metrics['num_frames']}):")
     if direct_add_metrics['add_auc'] is not None:
         print(f"#    AUC: {direct_add_metrics['add_auc']:.5f}")
         print(f"#       AUC threshold: {direct_add_metrics['add_auc_thresh']:.5f}")
@@ -876,7 +1112,7 @@ def run_inference(args):
         print("#    No valid frames for direct ADD")
 
     # PnP ADD (DREAM baseline)
-    print(f"\n# PnP ADD (m) - DREAM baseline: 2D pred + GT_3D + K (n = {pnp_metrics['num_pnp_found']}):")
+    print(f"\n# PnP ADD (m, camera-frame) - DREAM baseline: 2D pred + GT_3D + K (n = {pnp_metrics['num_pnp_found']}):")
     if pnp_metrics['num_pnp_found'] > 0:
         print(f"#    AUC: {pnp_metrics['add_auc']:.5f}")
         print(f"#       AUC threshold: {pnp_metrics['add_auc_thresh']:.5f}")
@@ -887,12 +1123,25 @@ def run_inference(args):
     else:
         print("#    No successful PnP solutions")
 
+    # RoboPEPP-style PnP ADD
+    print(f"\n# PnP ADD (m, camera-frame) - RoboPEPP-style: 2D pred + pred_3D_robot + K (n = {robopepp_pnp_metrics['num_pnp_found']}):")
+    if robopepp_pnp_metrics['num_pnp_found'] > 0:
+        print(f"#    AUC: {robopepp_pnp_metrics['add_auc']:.5f}")
+        print(f"#       AUC threshold: {robopepp_pnp_metrics['add_auc_thresh']:.5f}")
+        print(f"#    Mean: {robopepp_pnp_metrics['add_mean']:.5f}")
+        print(f"#    Median: {robopepp_pnp_metrics['add_median']:.5f}")
+        print(f"#    Std Dev: {robopepp_pnp_metrics['add_std']:.5f}")
+        print(f"#    PnP Success Rate: {robopepp_pnp_metrics['num_pnp_found']}/{robopepp_pnp_metrics['num_pnp_possible']} ({robopepp_pnp_metrics['num_pnp_found']/max(1, robopepp_pnp_metrics['num_pnp_possible'])*100:.1f}%)")
+    else:
+        print("#    No successful PnP solutions")
+
     # Joint angle metrics (if joint_angle mode)
     joint_angle_metrics = {}
     if all_joint_angles_pred is not None:
-        # Compare predicted vs GT joint angles (7 active joints: indices 0-6)
-        gt_angles_7 = all_joint_angles_gt[:, :7]  # (N, 7) first 7 joints
-        pred_angles_7 = all_joint_angles_pred[:, :7] if all_joint_angles_pred.shape[1] >= 7 else all_joint_angles_pred
+        # Compare predicted vs GT joint angles.
+        n_angle_eval = 6 if fix_joint7_zero else 7
+        gt_angles_7 = all_joint_angles_gt[:, :n_angle_eval]
+        pred_angles_7 = all_joint_angles_pred[:, :n_angle_eval] if all_joint_angles_pred.shape[1] >= n_angle_eval else all_joint_angles_pred
 
         # Only compare where GT angles are not all zero
         valid_mask = np.any(gt_angles_7 != 0, axis=-1)
@@ -911,7 +1160,7 @@ def run_inference(args):
 
             print(f"\n# Joint Angle Error (n = {joint_angle_metrics['num_frames']}):")
             print(f"#    Mean: {joint_angle_metrics['mean_rad']:.4f} rad ({joint_angle_metrics['mean_deg']:.2f} deg)")
-            joint_names = ['joint1', 'joint2', 'joint3', 'joint4', 'joint5', 'joint6', 'joint7']
+            joint_names = ['joint1', 'joint2', 'joint3', 'joint4', 'joint5', 'joint6', 'joint7'][:n_angle_eval]
             for j, (jname, jerr) in enumerate(zip(joint_names, joint_angle_metrics['per_joint_mean_deg'])):
                 print(f"#      {jname}: {jerr:.2f} deg")
 
@@ -928,7 +1177,8 @@ def run_inference(args):
             'num_frames': n_samples,
             'keypoint_metrics': {k: float(v) if v is not None else None for k, v in kp_metrics.items()},
             'direct_add_metrics': {k: float(v) if isinstance(v, (int, float, np.number)) else v for k, v in direct_add_metrics.items()},
-            'pnp_metrics': {k: float(v) if isinstance(v, (int, float, np.number)) else v for k, v in pnp_metrics.items()}
+            'pnp_metrics': {k: float(v) if isinstance(v, (int, float, np.number)) else v for k, v in pnp_metrics.items()},
+            'robopepp_pnp_metrics': {k: float(v) if isinstance(v, (int, float, np.number)) else v for k, v in robopepp_pnp_metrics.items()},
         }
 
         results_path = output_dir / 'eval_results.json'
@@ -1021,6 +1271,8 @@ def run_inference(args):
             per_frame_path = output_dir / 'per_frame_3d_errors.json'
             outlier_topk_path = output_dir / 'outlier_topk_3d_errors.json'
             kp_summary_path = output_dir / 'per_keypoint_3d_error_summary.json'
+            outlier_topk_json_names_txt = output_dir / 'outlier_topk_json_names.txt'
+            outlier_topk_json_paths_txt = output_dir / 'outlier_topk_json_paths.txt'
 
             with open(per_frame_path, 'w') as f:
                 json.dump(frame_reports_sorted, f, indent=2)
@@ -1028,10 +1280,22 @@ def run_inference(args):
                 json.dump(topk_reports, f, indent=2)
             with open(kp_summary_path, 'w') as f:
                 json.dump(kp_summary, f, indent=2)
+            with open(outlier_topk_json_names_txt, 'w') as f:
+                for item in topk_reports:
+                    name = item.get('json_name')
+                    if name:
+                        f.write(f"{name}\n")
+            with open(outlier_topk_json_paths_txt, 'w') as f:
+                for item in topk_reports:
+                    path = item.get('json_path')
+                    if path:
+                        f.write(f"{path}\n")
 
             print(f"Per-frame 3D error report saved to {per_frame_path}")
             print(f"Top-{topk} outlier report saved to {outlier_topk_path}")
             print(f"Per-keypoint 3D summary saved to {kp_summary_path}")
+            print(f"Top-{topk} json-name list saved to {outlier_topk_json_names_txt}")
+            print(f"Top-{topk} json-path list saved to {outlier_topk_json_paths_txt}")
 
     if is_distributed:
         cleanup_distributed()
@@ -1061,6 +1325,10 @@ def main():
                         help='Number of data loading workers')
     parser.add_argument('--distributed', action='store_true', default=False,
                         help='Enable distributed inference (launch with torchrun)')
+    parser.add_argument('--pred-3d-source', type=str, default='fk', choices=['fk', 'fused'],
+                        help='Robot-frame 3D source before PnP transform: fk (recommended) or fused')
+    parser.add_argument('--fix-joint7-zero', action='store_true', default=False,
+                        help='RoboPEPP-style setting: force joint7=0 for FK and angle metrics')
 
     # Metrics
     parser.add_argument('--kp-auc-threshold', type=float, default=20.0,
@@ -1075,6 +1343,20 @@ def main():
                         help='Save per-frame 3D error report and top-k outliers')
     parser.add_argument('--outlier-topk', type=int, default=100,
                         help='Number of worst frames to save in outlier report')
+    parser.add_argument('--robopepp-pnp-init-thresh', type=float, default=0.25,
+                        help='Initial heatmap-confidence threshold for RoboPEPP-style PnP keypoint selection')
+    parser.add_argument('--robopepp-pnp-conf-step', type=float, default=0.025,
+                        help='Threshold decrement step when not enough keypoints for RoboPEPP-style PnP')
+    parser.add_argument('--pnp-min-span-px', type=float, default=20.0,
+                        help='Minimum x/y span (px) of selected 2D keypoints required for PnP')
+    parser.add_argument('--pnp-min-area-ratio', type=float, default=0.001,
+                        help='Minimum 2D bbox area ratio of selected points for PnP')
+    parser.add_argument('--kp-min-confidence', type=float, default=0.0,
+                        help='Mask predicted 2D keypoints when sigmoid(max_heatmap_logit) is below this threshold')
+    parser.add_argument('--kp-min-peak-logit', type=float, default=-1e9,
+                        help='Mask predicted 2D keypoints when heatmap peak logit is below this threshold')
+    parser.add_argument('--fill-invalid-2d-with-fk-reproj', action='store_true',
+                        help='After successful PnP, fill invalid/low-reliability 2D keypoints using FK reprojection')
 
     args = parser.parse_args()
 

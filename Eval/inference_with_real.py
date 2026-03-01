@@ -5,6 +5,7 @@ Real Image Inference Script for DINOv3 Pose Estimation
 """
 
 import argparse
+import importlib.util
 import json
 import math
 import os
@@ -27,20 +28,89 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../Trai
 from model import DINOv3PoseEstimator
 
 
-def get_keypoints_from_heatmaps(heatmaps_tensor):
-    """Extract keypoint coordinates from heatmaps using argmax."""
+def _resolve_robopepp_urdf(explicit_urdf_path=None):
+    if explicit_urdf_path:
+        return explicit_urdf_path
+    return os.path.abspath(
+        os.path.join(os.path.dirname(__file__), "../RoboPEPP/urdfs/Panda/panda.urdf")
+    )
+
+
+def _load_robopepp_panda_fk_class():
+    module_path = os.path.abspath(
+        os.path.join(os.path.dirname(__file__), "../RoboPEPP/models/robot_arm.py")
+    )
+    spec = importlib.util.spec_from_file_location("robopepp_robot_arm", module_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Failed to load RoboPEPP FK module: {module_path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.PandaArmPytorch
+
+
+def _compute_robopepp_fk_keypoints(joint_angles, device, urdf_file, fix_joint7_zero=False):
+    PandaArmPytorch = _load_robopepp_panda_fk_class()
+    robot = PandaArmPytorch(urdf_file, device=str(device))
+    if joint_angles.shape[1] >= 7:
+        joint_angles_fk = joint_angles[:, :7].clone()
+    else:
+        pad = torch.zeros(
+            (joint_angles.shape[0], 7 - joint_angles.shape[1]),
+            device=joint_angles.device,
+            dtype=joint_angles.dtype,
+        )
+        joint_angles_fk = torch.cat([joint_angles, pad], dim=1)
+    if fix_joint7_zero and joint_angles_fk.shape[1] >= 7:
+        # Match RoboPEPP eval convention: use 6 predicted joints and fix joint7 to zero.
+        joint_angles_fk[:, 6] = 0.0
+    # Match RoboPEPP/test.py keypoint subset: link0,2,3,4,6,7,hand
+    _, keypoints_3d = robot.get_joint_RT(joint_angles_fk)
+    return keypoints_3d[:, [0, 2, 3, 4, 6, 7, 8], :]
+
+
+def get_keypoints_from_heatmaps(heatmaps_tensor, min_confidence=0.0, min_peak_logit=None):
+    """Extract keypoint coordinates from heatmaps and optionally mask low confidence."""
     B, N, H, W = heatmaps_tensor.shape
     heatmaps_flat = heatmaps_tensor.view(B, N, -1)
     max_indices = torch.argmax(heatmaps_flat, dim=-1)
     y = max_indices // W
     x = max_indices % W
-    keypoints = torch.stack([x, y], dim=-1).float()
-    return keypoints[0].cpu().numpy()
+    keypoints = torch.stack([x, y], dim=-1).float()  # (B, N, 2)
+
+    # Convert max logit to probability-like confidence in [0, 1].
+    peak_logits = heatmaps_flat.amax(dim=-1)  # (B, N)
+    confidences = torch.sigmoid(peak_logits)  # (B, N)
+    invalid = torch.zeros_like(confidences, dtype=torch.bool)
+    if min_confidence > 0.0:
+        invalid = invalid | (confidences < float(min_confidence))
+    if min_peak_logit is not None:
+        invalid = invalid | (peak_logits < float(min_peak_logit))
+    if invalid.any():
+        keypoints = keypoints.masked_fill(invalid.unsqueeze(-1), -999.0)
+
+    return (
+        keypoints[0].cpu().numpy(),
+        confidences[0].cpu().numpy(),
+        peak_logits[0].cpu().numpy(),
+    )
 
 
-def transform_robot_to_camera(robot_kpts, pred_2d, camera_K):
+def transform_robot_to_camera(
+    robot_kpts,
+    pred_2d,
+    camera_K,
+    confidences=None,
+    topk=6,
+    min_points=4,
+    ransac_reproj_error=5.0,
+    pnp_mode="epnp",
+    reproj_outlier_thresh_px=12.0,
+    reproj_refit=True,
+    min_span_px=20.0,
+    min_area_ratio=0.001,
+):
     """
-    Transform robot frame keypoints to camera frame using EPnP.
+    Transform robot frame keypoints to camera frame using PnP.
 
     Args:
         robot_kpts: (N, 3) keypoints in robot frame
@@ -49,30 +119,164 @@ def transform_robot_to_camera(robot_kpts, pred_2d, camera_K):
 
     Returns:
         camera_kpts: (N, 3) keypoints in camera frame (or None if PnP fails)
+        info: dict with selected/ignored index diagnostics
     """
+    info = {
+        "idx_valid": np.array([], dtype=np.int64),
+        "idx_selected_initial": np.array([], dtype=np.int64),
+        "idx_selected_final": np.array([], dtype=np.int64),
+        "idx_removed_reproj": np.array([], dtype=np.int64),
+        "reproj_errors_px": np.array([], dtype=np.float64),
+        "inlier_count": 0,
+        "k_used": 0,
+        "refit_applied": False,
+        "spread_ok": True,
+        "spread_span_xy_px": [0.0, 0.0],
+        "spread_area_ratio": 0.0,
+        "proj_2d_all": None,
+    }
     try:
-        # EPnP requires at least 4 points
-        if len(robot_kpts) < 4:
+        # PnP requires at least 4 points
+        if len(robot_kpts) < min_points:
             print(f"Warning: PnP requires at least 4 points, got {len(robot_kpts)}")
-            return None
+            return None, info
 
         # Ensure correct data types
         robot_kpts = robot_kpts.astype(np.float64)
         pred_2d = pred_2d.astype(np.float64)
         camera_K = camera_K.astype(np.float64)
+        if confidences is None:
+            confidences = np.ones((len(robot_kpts),), dtype=np.float64)
+        else:
+            confidences = np.asarray(confidences, dtype=np.float64)
 
-        # Solve PnP with EPnP algorithm
-        success, rvec, tvec = cv2.solvePnP(
-            robot_kpts,
-            pred_2d,
-            camera_K,
-            None,  # No distortion
-            flags=cv2.SOLVEPNP_EPNP  # Use EPnP algorithm
+        valid = (
+            np.isfinite(robot_kpts).all(axis=1)
+            & np.isfinite(pred_2d).all(axis=1)
+            & (pred_2d[:, 0] > -900.0)
+            & (pred_2d[:, 1] > -900.0)
         )
+        idx_valid = np.where(valid)[0]
+        info["idx_valid"] = idx_valid
+        if idx_valid.shape[0] < min_points:
+            print("Warning: Not enough valid keypoints for PnP")
+            return None, info
+
+        # Baseline uses all valid points; robust modes can use top-k.
+        if pnp_mode == "epnp":
+            idx_sel = idx_valid
+        else:
+            idx_sorted = idx_valid[np.argsort(confidences[idx_valid])[::-1]]
+            k = max(min_points, min(int(topk), idx_sorted.shape[0]))
+            idx_sel = idx_sorted[:k]
+        info["idx_selected_initial"] = idx_sel.copy()
+        robot_sel = robot_kpts[idx_sel]
+        pred2d_sel = pred_2d[idx_sel]
+
+        # Spatial spread check: reject degenerate PnP sets concentrated in a tiny image region.
+        x_span = float(np.max(pred2d_sel[:, 0]) - np.min(pred2d_sel[:, 0]))
+        y_span = float(np.max(pred2d_sel[:, 1]) - np.min(pred2d_sel[:, 1]))
+        bbox_area = max(0.0, x_span) * max(0.0, y_span)
+        img_area = max(1.0, float(camera_K[0, 2] * 2.0) * float(camera_K[1, 2] * 2.0))
+        area_ratio = bbox_area / img_area
+        info["spread_span_xy_px"] = [x_span, y_span]
+        info["spread_area_ratio"] = area_ratio
+        if x_span < float(min_span_px) or y_span < float(min_span_px) or area_ratio < float(min_area_ratio):
+            info["spread_ok"] = False
+            print(
+                f"Warning: PnP rejected by spatial spread check "
+                f"(span=({x_span:.1f},{y_span:.1f})px, area_ratio={area_ratio:.5f})"
+            )
+            return None, info
+
+        def solve_epnp(obj_pts, img_pts):
+            return cv2.solvePnP(
+                obj_pts, img_pts, camera_K, None, flags=cv2.SOLVEPNP_EPNP
+            )
+
+        def reproj_mse(rvec_in, tvec_in, obj_pts_all, img_pts_all):
+            proj, _ = cv2.projectPoints(obj_pts_all, rvec_in, tvec_in, camera_K, None)
+            proj = proj.reshape(-1, 2)
+            err = np.linalg.norm(proj - img_pts_all, axis=1)
+            return float(np.mean(err))
+
+        if pnp_mode == "ransac":
+            # First try RANSAC for robustness under occlusion/outliers.
+            success, rvec, tvec, inliers = cv2.solvePnPRansac(
+                robot_sel,
+                pred2d_sel,
+                camera_K,
+                None,  # No distortion
+                reprojectionError=float(ransac_reproj_error),
+                flags=cv2.SOLVEPNP_EPNP,
+            )
+            # Fallback: plain EPnP on selected points.
+            if not success:
+                success, rvec, tvec = cv2.solvePnP(
+                    robot_sel,
+                    pred2d_sel,
+                    camera_K,
+                    None,
+                    flags=cv2.SOLVEPNP_EPNP
+                )
+                inlier_count = 0
+            else:
+                inlier_count = 0 if inliers is None else len(inliers)
+            k_used = len(idx_sel)
+        elif pnp_mode == "loo_epnp":
+            # Leave-one-out EPnP: fit multiple hypotheses and pick lowest reprojection error.
+            if len(idx_sel) < min_points:
+                print("Warning: Not enough selected keypoints for loo_epnp")
+                return None, info
+            best = None
+            subsets = [idx_sel]
+            if len(idx_sel) > min_points:
+                for drop_i in range(len(idx_sel)):
+                    sub = np.delete(idx_sel, drop_i)
+                    if len(sub) >= min_points:
+                        subsets.append(sub)
+            for sub in subsets:
+                ok, rv, tv = solve_epnp(robot_kpts[sub], pred_2d[sub])
+                if not ok:
+                    continue
+                mse = reproj_mse(rv, tv, robot_kpts[idx_sel], pred_2d[idx_sel])
+                if best is None or mse < best[0]:
+                    best = (mse, rv, tv)
+            if best is None:
+                print("Warning: loo_epnp failed to find solution")
+                return None, info
+            success, rvec, tvec = True, best[1], best[2]
+            inlier_count = 0
+            k_used = len(idx_sel)
+        else:  # epnp
+            success, rvec, tvec = solve_epnp(robot_sel, pred2d_sel)
+            inlier_count = 0
+            k_used = len(idx_sel)
 
         if not success:
-            print("Warning: EPnP failed to find solution")
-            return None
+            print("Warning: PnP failed to find solution")
+            return None, info
+
+        # Reprojection outlier rejection + refit:
+        # drop points with large reprojection residual, then solve again.
+        idx_final = idx_sel.copy()
+        if reproj_refit and idx_sel.shape[0] >= min_points:
+            proj_sel, _ = cv2.projectPoints(robot_sel, rvec, tvec, camera_K, None)
+            proj_sel = proj_sel.reshape(-1, 2)
+            reproj_err = np.linalg.norm(proj_sel - pred2d_sel, axis=1)
+            keep_mask = reproj_err <= float(reproj_outlier_thresh_px)
+            removed = idx_sel[~keep_mask]
+            if np.count_nonzero(keep_mask) >= min_points and removed.shape[0] > 0:
+                idx_final = idx_sel[keep_mask]
+                success2, rvec2, tvec2 = solve_epnp(robot_kpts[idx_final], pred_2d[idx_final])
+                if success2:
+                    rvec, tvec = rvec2, tvec2
+                    info["refit_applied"] = True
+                # If refit fails, keep original estimate but still report removed points.
+            info["idx_removed_reproj"] = removed
+            info["reproj_errors_px"] = reproj_err
+        else:
+            info["reproj_errors_px"] = np.array([], dtype=np.float64)
 
         # Convert rotation vector to rotation matrix
         R, _ = cv2.Rodrigues(rvec)
@@ -80,12 +284,23 @@ def transform_robot_to_camera(robot_kpts, pred_2d, camera_K):
 
         # Transform: camera_frame = R @ robot_frame + t
         camera_kpts = (R @ robot_kpts.T).T + t.reshape(1, 3)
+        proj_all, _ = cv2.projectPoints(robot_kpts, rvec, tvec, camera_K, None)
+        info["proj_2d_all"] = proj_all.reshape(-1, 2)
+        info["idx_selected_final"] = idx_final
+        info["inlier_count"] = int(inlier_count)
+        info["k_used"] = int(len(idx_final))
+        print(f"# PnP mode={pnp_mode}, used {len(idx_final)} points, inliers={inlier_count}")
+        if reproj_refit and info["idx_removed_reproj"].shape[0] > 0:
+            print(
+                f"# PnP reprojection outlier rejection: removed {info['idx_removed_reproj'].shape[0]} points "
+                f"(thresh={reproj_outlier_thresh_px:.1f}px), final used={len(idx_final)}"
+            )
 
-        return camera_kpts
+        return camera_kpts, info
 
     except Exception as e:
         print(f"Warning: PnP failed with error: {e}")
-        return None
+        return None, info
 
 
 def load_annotation(json_path, keypoint_names):
@@ -160,6 +375,10 @@ def compute_metrics(pred_2d, gt_2d, pred_3d, gt_3d, keypoint_names, found, orig_
             (0.0 <= gt_2d[i][1] <= img_h)
         )
         if in_frame:
+            pred_valid = np.isfinite(pred_2d[i]).all() and (pred_2d[i][0] > -900.0) and (pred_2d[i][1] > -900.0)
+            if not pred_valid:
+                metrics[f'{name}_2d_px'] = float('nan')
+                continue
             err = np.linalg.norm(pred_2d[i] - gt_2d[i])
             errors_2d.append(err)
             metrics[f'{name}_2d_px'] = err
@@ -180,6 +399,10 @@ def compute_metrics(pred_2d, gt_2d, pred_3d, gt_3d, keypoint_names, found, orig_
             (0.0 <= gt_2d[i][1] <= img_h)
         )
         if in_frame and not np.allclose(gt_3d[i], 0):
+            pred2d_valid = np.isfinite(pred_2d[i]).all() and (pred_2d[i][0] > -900.0) and (pred_2d[i][1] > -900.0)
+            if not pred2d_valid:
+                metrics[f'{name}_3d_m'] = float('nan')
+                continue
             err = np.linalg.norm(pred_3d[i] - gt_3d[i])
             errors_3d.append(err)
             metrics[f'{name}_3d_m'] = err
@@ -224,9 +447,11 @@ def network_inference(args):
     use_joint_embedding = False
     use_iterative_refinement = False
     refinement_iterations = 3
+    fix_joint7_zero = False
     model_name = args.model_name
     image_size = 512
     heatmap_size = 512
+    urdf_file = args.robopepp_urdf
 
     if config_path.exists():
         with open(config_path, 'r') as f:
@@ -234,12 +459,24 @@ def network_inference(args):
         use_joint_embedding = train_config.get('use_joint_embedding', False)
         use_iterative_refinement = train_config.get('use_iterative_refinement', False)
         refinement_iterations = int(train_config.get('refinement_iterations', 3))
+        fix_joint7_zero = bool(train_config.get('fix_joint7_zero', False))
         model_name = train_config.get('model_name', model_name)
         image_size = int(train_config.get('image_size', image_size))
         heatmap_size = int(train_config.get('heatmap_size', heatmap_size))
+        if urdf_file is None:
+            if isinstance(train_config.get('model'), dict):
+                urdf_file = train_config['model'].get('urdf_file')
+            if urdf_file is None:
+                urdf_file = train_config.get('urdf_file')
+            if urdf_file is not None and not os.path.isabs(urdf_file):
+                urdf_file = os.path.abspath(checkpoint_dir / urdf_file)
         if 'keypoint_names' in train_config:
             keypoint_names = train_config['keypoint_names']
-        print(f"# Config: use_joint_embedding={use_joint_embedding}, iterative_refinement={use_iterative_refinement}")
+        print(
+            f"# Config: use_joint_embedding={use_joint_embedding}, "
+            f"iterative_refinement={use_iterative_refinement}, "
+            f"fix_joint7_zero={fix_joint7_zero}"
+        )
 
     # Load annotation JSON
     print(f"\n# Loading annotation: {args.json_path}")
@@ -263,6 +500,7 @@ def network_inference(args):
         use_joint_embedding=use_joint_embedding,
         use_iterative_refinement=use_iterative_refinement,
         refinement_iterations=refinement_iterations,
+        fix_joint7_zero=fix_joint7_zero,
     ).to(device)
 
     # Load checkpoint
@@ -277,7 +515,19 @@ def network_inference(args):
         if len(mask_shape) == 3 and mask_shape[1] == 1:
             del state_dict['backbone.model.embeddings.mask_token']
 
-    model.load_state_dict(state_dict, strict=False)
+    # Drop shape-mismatched keys (e.g., 7-angle ckpt loaded into 6-angle head model).
+    model_state = model.state_dict()
+    filtered_state = {}
+    dropped = []
+    for k, v in state_dict.items():
+        if k in model_state and model_state[k].shape == v.shape:
+            filtered_state[k] = v
+        elif k in model_state:
+            dropped.append(k)
+    if dropped:
+        print(f"# Dropping {len(dropped)} mismatched checkpoint keys (shape mismatch)")
+
+    model.load_state_dict(filtered_state, strict=False)
     model.eval()
     if 'epoch' in checkpoint:
         print(f"# Checkpoint epoch: {checkpoint['epoch']}")
@@ -310,10 +560,31 @@ def network_inference(args):
             use_refinement=use_iterative_refinement
         )
         pred_heatmaps = outputs["heatmaps_2d"]
-        pred_kpts_3d = outputs["keypoints_3d"]
+        if args.pred_3d_source == "fk":
+            # In joint-angle mode, FK branch is the most stable robot-frame 3D source.
+            pred_kpts_3d = outputs["keypoints_3d_fk"] if "keypoints_3d_fk" in outputs else outputs["keypoints_3d"]
+        elif args.pred_3d_source == "fk_robopepp":
+            if "joint_angles" not in outputs or outputs["joint_angles"] is None:
+                print("# Warning: joint_angles missing, fallback to model FK output")
+                pred_kpts_3d = outputs["keypoints_3d_fk"] if "keypoints_3d_fk" in outputs else outputs["keypoints_3d"]
+            else:
+                urdf_file = _resolve_robopepp_urdf(urdf_file)
+                print(f"# FK source: RoboPEPP URDF FK ({urdf_file})")
+                if args.robopepp_fix_joint7_zero:
+                    print("# FK option: forcing joint7=0 to match RoboPEPP 6-DoF eval convention")
+                pred_kpts_3d = _compute_robopepp_fk_keypoints(
+                    outputs["joint_angles"], device, urdf_file,
+                    fix_joint7_zero=args.robopepp_fix_joint7_zero
+                )
+        else:
+            pred_kpts_3d = outputs["keypoints_3d"]
 
     # Extract 2D keypoints from heatmaps (in heatmap coordinate space)
-    pred_2d_heatmap = get_keypoints_from_heatmaps(pred_heatmaps)
+    pred_2d_heatmap, pred_conf, pred_peak_logit = get_keypoints_from_heatmaps(
+        pred_heatmaps,
+        min_confidence=args.kp_min_confidence,
+        min_peak_logit=args.kp_min_peak_logit,
+    )
 
     # Scale predicted 2D to original image coordinates
     pred_2d_orig = pred_2d_heatmap.copy()
@@ -322,19 +593,81 @@ def network_inference(args):
 
     # 3D predictions - handle different modes
     pred_3d_raw = pred_kpts_3d[0].cpu().numpy()
+    print(f"# 3D source: {args.pred_3d_source}")
+    n_invalid = int(np.count_nonzero(pred_conf < float(args.kp_min_confidence)))
+    if args.kp_min_confidence > 0.0 and n_invalid > 0:
+        print(f"# Low-confidence keypoints masked: {n_invalid}/{len(pred_conf)} (threshold={args.kp_min_confidence:.3f})")
+    n_low_peak = int(np.count_nonzero(pred_peak_logit < float(args.kp_min_peak_logit)))
+    if args.kp_min_peak_logit is not None and n_low_peak > 0:
+        print(f"# Low-peak keypoints masked: {n_low_peak}/{len(pred_peak_logit)} (threshold={args.kp_min_peak_logit:.3f} logit)")
 
+    low_conf_mask = pred_conf < float(args.kp_min_confidence)
+    low_peak_mask = pred_peak_logit < float(args.kp_min_peak_logit)
+    low_reliability_mask = low_conf_mask | low_peak_mask
+    pnp_info = None
     # Transform from robot frame to camera frame using PnP
     if camera_K is not None:
         print("# Transforming robot frame → camera frame using PnP...")
-        pred_3d = transform_robot_to_camera(pred_3d_raw, pred_2d_orig, camera_K)
+        pred_3d, pnp_info = transform_robot_to_camera(
+            pred_3d_raw,
+            pred_2d_orig,
+            camera_K,
+            confidences=pred_conf,
+            topk=args.pnp_topk,
+            min_points=4,
+            ransac_reproj_error=args.pnp_ransac_reproj_error,
+            pnp_mode=args.pnp_mode,
+            reproj_outlier_thresh_px=args.pnp_reproj_outlier_thresh,
+            reproj_refit=(not args.disable_pnp_reproj_refit),
+            min_span_px=args.pnp_min_span_px,
+            min_area_ratio=args.pnp_min_area_ratio,
+        )
         if pred_3d is None:
             print("# Warning: PnP failed, using robot frame coordinates (comparison with GT will be invalid)")
             pred_3d = pred_3d_raw
         else:
             print("# Successfully transformed to camera frame")
+            if args.fill_invalid_2d_with_fk_reproj:
+                proj_all = pnp_info.get("proj_2d_all", None) if pnp_info is not None else None
+                if proj_all is not None:
+                    replaced = 0
+                    for i in range(len(pred_2d_orig)):
+                        pred_valid = np.isfinite(pred_2d_orig[i]).all() and (pred_2d_orig[i][0] > -900.0) and (pred_2d_orig[i][1] > -900.0)
+                        if (not pred_valid) or low_reliability_mask[i]:
+                            pred_2d_orig[i] = proj_all[i]
+                            replaced += 1
+                    if replaced > 0:
+                        print(f"# FK reprojection fill: replaced {replaced} low-reliability/invalid 2D keypoints")
     else:
         print("# Warning: No camera K available, using robot frame coordinates (comparison with GT will be invalid)")
         pred_3d = pred_3d_raw
+
+    ignored_low_conf = [keypoint_names[i] for i in range(len(keypoint_names)) if low_conf_mask[i]]
+    ignored_low_peak = [keypoint_names[i] for i in range(len(keypoint_names)) if low_peak_mask[i]]
+    ignored_reproj = []
+    ignored_pnp_select = []
+    if pnp_info is not None:
+        idx_removed_reproj = set([int(x) for x in pnp_info.get("idx_removed_reproj", [])])
+        idx_used_final = set([int(x) for x in pnp_info.get("idx_selected_final", [])])
+        ignored_reproj = [keypoint_names[i] for i in sorted(idx_removed_reproj)]
+        ignored_pnp_select = [
+            keypoint_names[i]
+            for i in range(len(keypoint_names))
+            if (i not in idx_used_final) and (i not in idx_removed_reproj) and (not low_conf_mask[i]) and (not low_peak_mask[i])
+        ]
+
+    if ignored_low_conf or ignored_low_peak or ignored_reproj or ignored_pnp_select:
+        print("# Ignored keypoints summary:")
+        if ignored_low_peak:
+            print(f"#   low_peak_logit ({args.kp_min_peak_logit:.3f}): {', '.join(ignored_low_peak)}")
+        if ignored_low_conf:
+            print(f"#   low_conf ({args.kp_min_confidence:.3f}): {', '.join(ignored_low_conf)}")
+        if ignored_reproj:
+            print(f"#   reproj_outlier ({args.pnp_reproj_outlier_thresh:.1f}px): {', '.join(ignored_reproj)}")
+        if ignored_pnp_select:
+            print(f"#   pnp_select/topk: {', '.join(ignored_pnp_select)}")
+    else:
+        print("# Ignored keypoints summary: none")
 
     # === Compute Metrics ===
     metrics = compute_metrics(pred_2d_orig, gt_2d, pred_3d, gt_3d, keypoint_names, found, orig_dim)
@@ -344,8 +677,17 @@ def network_inference(args):
     print("  RESULTS: GT (green) vs Prediction (red)")
     print("=" * 80)
 
-    print(f"\n{'Keypoint':<20} {'GT 2D (px)':<22} {'Pred 2D (px)':<22} {'2D Err (px)':<12}")
-    print("-" * 76)
+    idx_removed_reproj = set()
+    idx_pnp_used = set()
+    if pnp_info is not None:
+        idx_removed_reproj = set([int(x) for x in pnp_info.get("idx_removed_reproj", [])])
+        idx_pnp_used = set([int(x) for x in pnp_info.get("idx_selected_final", [])])
+
+    print(
+        f"\n{'Keypoint':<20} {'Status':<20} {'Peak(logit)':<12} "
+        f"{'Peak(sigmoid)':<14} {'GT 2D (px)':<22} {'Pred 2D (px)':<22} {'2D Err (px)':<12}"
+    )
+    print("-" * 130)
     for i, name in enumerate(keypoint_names):
         in_frame = (
             found[i] and
@@ -353,9 +695,29 @@ def network_inference(args):
             (0.0 <= gt_2d[i][1] <= orig_dim[1])
         )
         gt_str = f"({gt_2d[i][0]:7.1f}, {gt_2d[i][1]:7.1f})" if found[i] else "  N/A"
-        pred_str = f"({pred_2d_orig[i][0]:7.1f}, {pred_2d_orig[i][1]:7.1f})"
-        err_str = f"{metrics.get(f'{name}_2d_px', float('nan')):8.2f}" if in_frame else "  N/A"
-        print(f"  {name:<18} {gt_str:<22} {pred_str:<22} {err_str}")
+        pred_valid = np.isfinite(pred_2d_orig[i]).all() and (pred_2d_orig[i][0] > -900.0) and (pred_2d_orig[i][1] > -900.0)
+        pred_str = f"({pred_2d_orig[i][0]:7.1f}, {pred_2d_orig[i][1]:7.1f})" if pred_valid else "  IGNORED"
+        if low_peak_mask[i]:
+            status = "IGNORED(low_peak)"
+        elif low_conf_mask[i]:
+            status = "IGNORED(low_conf)"
+        elif i in idx_removed_reproj:
+            status = "IGNORED(reproj)"
+        elif pnp_info is not None and i not in idx_pnp_used:
+            status = "IGNORED(pnp_select)"
+        else:
+            status = "USED"
+
+        if in_frame and pred_valid:
+            err_str = f"{metrics.get(f'{name}_2d_px', float('nan')):8.2f}"
+        elif in_frame:
+            err_str = "  N/A"
+        else:
+            err_str = "  N/A"
+        print(
+            f"  {name:<18} {status:<20} {pred_peak_logit[i]:10.4f}   {pred_conf[i]:10.4f}   "
+            f"{gt_str:<22} {pred_str:<22} {err_str}"
+        )
 
     print(f"\n  Mean 2D error:   {metrics.get('mean_2d_px', float('nan')):.2f} px")
     print(f"  Median 2D error: {metrics.get('median_2d_px', float('nan')):.2f} px")
@@ -441,6 +803,19 @@ def network_inference(args):
         gt_2d_input_list = [gt_2d_input[i].tolist() if found[i] else None for i in range(len(keypoint_names))]
         gt_2d_input_valid = [pt for pt in gt_2d_input_list if pt is not None]
         gt_names_valid = [name for i, name in enumerate(keypoint_names) if found[i]]
+        pred_2d_input_valid = []
+        pred_2d_input_valid_names = []
+        pred_2d_orig_valid = []
+        pred_2d_orig_valid_names = []
+        for i, name in enumerate(keypoint_names):
+            is_valid_in = np.isfinite(pred_2d_input[i]).all() and (pred_2d_input[i][0] > -900.0) and (pred_2d_input[i][1] > -900.0)
+            is_valid_orig = np.isfinite(pred_2d_orig[i]).all() and (pred_2d_orig[i][0] > -900.0) and (pred_2d_orig[i][1] > -900.0)
+            if is_valid_in:
+                pred_2d_input_valid.append(pred_2d_input[i].tolist())
+                pred_2d_input_valid_names.append(name)
+            if is_valid_orig:
+                pred_2d_orig_valid.append(pred_2d_orig[i].tolist())
+                pred_2d_orig_valid_names.append(name)
 
         # 1. GT (green) + Pred (red) on image
         overlay = image_resized.copy()
@@ -449,10 +824,11 @@ def network_inference(args):
                 overlay, gt_2d_input_valid, gt_names_valid,
                 annotation_color_dot="green", annotation_color_text="white",
             )
-        overlay = dream.image_proc.overlay_points_on_image(
-            overlay, pred_2d_input, keypoint_names,
-            annotation_color_dot="red", annotation_color_text="white",
-        )
+        if pred_2d_input_valid:
+            overlay = dream.image_proc.overlay_points_on_image(
+                overlay, pred_2d_input_valid, pred_2d_input_valid_names,
+                annotation_color_dot="red", annotation_color_text="white",
+            )
         out_path = os.path.join(args.output_dir, "01_gt_vs_pred_keypoints.png")
         overlay.save(out_path)
         print(f"  Saved: {out_path}")
@@ -471,16 +847,22 @@ def network_inference(args):
         )
         belief_map_images_kp = []
         for kp_idx in range(len(keypoint_names)):
-            points = [pred_2d_heatmap[kp_idx]]
-            colors = ["red"]
+            points = []
+            colors = []
+            if np.isfinite(pred_2d_heatmap[kp_idx]).all() and (pred_2d_heatmap[kp_idx][0] > -900.0) and (pred_2d_heatmap[kp_idx][1] > -900.0):
+                points.append(pred_2d_heatmap[kp_idx])
+                colors.append("red")
             if gt_2d_heatmap_list and gt_2d_heatmap_list[kp_idx] is not None:
                 points.insert(0, gt_2d_heatmap_list[kp_idx])
                 colors.insert(0, "green")
-            bm_kp = dream.image_proc.overlay_points_on_image(
-                belief_map_images[kp_idx], points,
-                annotation_color_dot=colors, annotation_color_text=colors,
-                point_diameter=4,
-            )
+            if points:
+                bm_kp = dream.image_proc.overlay_points_on_image(
+                    belief_map_images[kp_idx], points,
+                    annotation_color_dot=colors, annotation_color_text=colors,
+                    point_diameter=4,
+                )
+            else:
+                bm_kp = belief_map_images[kp_idx]
             belief_map_images_kp.append(bm_kp)
 
         n_cols = int(math.ceil(len(keypoint_names) / 2.0))
@@ -497,10 +879,11 @@ def network_inference(args):
         for n in range(len(keypoint_names)):
             bm = belief_map_images[n].resize(input_dim, resample=PILImage.BILINEAR)
             blended = PILImage.blend(image_resized, bm, alpha=0.5)
-            blended = dream.image_proc.overlay_points_on_image(
-                blended, [pred_2d_input[n]], [keypoint_names[n]],
-                annotation_color_dot="red", annotation_color_text="white",
-            )
+            if np.isfinite(pred_2d_input[n]).all() and (pred_2d_input[n][0] > -900.0) and (pred_2d_input[n][1] > -900.0):
+                blended = dream.image_proc.overlay_points_on_image(
+                    blended, [pred_2d_input[n]], [keypoint_names[n]],
+                    annotation_color_dot="red", annotation_color_text="white",
+                )
             if found[n]:
                 blended = dream.image_proc.overlay_points_on_image(
                     blended, [gt_2d_input[n].tolist()], [keypoint_names[n]],
@@ -528,10 +911,11 @@ def network_inference(args):
                 orig_overlay, gt_valid_orig, gt_names_valid,
                 annotation_color_dot="green", annotation_color_text="white",
             )
-        orig_overlay = dream.image_proc.overlay_points_on_image(
-            orig_overlay, pred_2d_orig, keypoint_names,
-            annotation_color_dot="red", annotation_color_text="white",
-        )
+        if pred_2d_orig_valid:
+            orig_overlay = dream.image_proc.overlay_points_on_image(
+                orig_overlay, pred_2d_orig_valid, pred_2d_orig_valid_names,
+                annotation_color_dot="red", annotation_color_text="white",
+            )
         out_path = os.path.join(args.output_dir, "04_combined_on_original.png")
         orig_overlay.save(out_path)
         print(f"  Saved: {out_path}")
@@ -542,6 +926,30 @@ def network_inference(args):
         metrics_json = {k: float(v) if not np.isnan(v) else None for k, v in metrics.items()}
         metrics_json['json_path'] = args.json_path
         metrics_json['image_path'] = image_path
+        metrics_json['ignored_keypoints'] = {
+            'low_peak_logit': ignored_low_peak,
+            'low_conf': ignored_low_conf,
+            'reproj_outlier': ignored_reproj,
+            'pnp_select': ignored_pnp_select,
+        }
+        metrics_json['pnp'] = {
+            'mode': args.pnp_mode,
+            'reproj_outlier_thresh_px': float(args.pnp_reproj_outlier_thresh),
+            'min_span_px': float(args.pnp_min_span_px),
+            'min_area_ratio': float(args.pnp_min_area_ratio),
+            'used_keypoints': sorted(list(idx_pnp_used)),
+            'removed_reproj_keypoints': sorted(list(idx_removed_reproj)),
+            'spread_ok': bool(pnp_info.get('spread_ok', True)) if pnp_info is not None else None,
+            'spread_span_xy_px': (pnp_info.get('spread_span_xy_px') if pnp_info is not None else None),
+            'spread_area_ratio': (float(pnp_info.get('spread_area_ratio')) if (pnp_info is not None and pnp_info.get('spread_area_ratio') is not None) else None),
+        }
+        metrics_json['heatmap_peak'] = {
+            name: {
+                'peak_logit': float(pred_peak_logit[i]),
+                'peak_sigmoid': float(pred_conf[i]),
+            }
+            for i, name in enumerate(keypoint_names)
+        }
         with open(metrics_path, 'w') as f:
             json.dump(metrics_json, f, indent=2)
         print(f"  Saved: {metrics_path}")
@@ -561,6 +969,32 @@ if __name__ == "__main__":
                         help="Directory to save visualizations and metrics")
     parser.add_argument("--model-name", default="facebook/dinov3-vitb16-pretrain-lvd1689m",
                         help="DINOv3 model name (overridden by config.yaml)")
+    parser.add_argument("--pred-3d-source", type=str, default="fk", choices=["fk", "fk_robopepp", "fused"],
+                        help="Robot-frame 3D source before PnP transform")
+    parser.add_argument("--robopepp-urdf", type=str, default=None,
+                        help="Override Panda URDF path used when --pred-3d-source=fk_robopepp")
+    parser.add_argument("--robopepp-fix-joint7-zero", action="store_true",
+                        help="When using fk_robopepp, force joint7=0 (RoboPEPP 6-joint convention)")
+    parser.add_argument("--pnp-topk", type=int, default=6,
+                        help="Use top-k confident keypoints for PnP")
+    parser.add_argument("--pnp-ransac-reproj-error", type=float, default=5.0,
+                        help="RANSAC reprojection threshold (px)")
+    parser.add_argument("--pnp-mode", type=str, default="epnp", choices=["epnp", "loo_epnp", "ransac"],
+                        help="PnP solver mode")
+    parser.add_argument("--pnp-reproj-outlier-thresh", type=float, default=12.0,
+                        help="After initial PnP, ignore keypoints with reprojection error above this threshold (px)")
+    parser.add_argument("--disable-pnp-reproj-refit", action="store_true",
+                        help="Disable reprojection outlier rejection + refit step")
+    parser.add_argument("--pnp-min-span-px", type=float, default=20.0,
+                        help="Minimum x/y span (px) of selected 2D keypoints required for PnP")
+    parser.add_argument("--pnp-min-area-ratio", type=float, default=0.001,
+                        help="Minimum 2D bbox area ratio of selected points for PnP")
+    parser.add_argument("--kp-min-peak-logit", type=float, default=-1e9,
+                        help="Mask predicted 2D keypoints when heatmap peak logit is below this threshold")
+    parser.add_argument("--kp-min-confidence", type=float, default=0.0,
+                        help="Mask predicted 2D keypoints when sigmoid(max_heatmap_logit) is below this threshold")
+    parser.add_argument("--fill-invalid-2d-with-fk-reproj", action="store_true",
+                        help="After successful PnP, fill invalid/low-reliability 2D keypoints using FK reprojection")
     args = parser.parse_args()
 
     network_inference(args)

@@ -3,28 +3,27 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# Real Image Inference Script for DINOv3 Pose Estimation
-# Input: JSON annotation file (contains image path + GT keypoints)
-# Output: GT vs Prediction visualizations + error metrics
-
-# =============================================================================
-# Configuration
-# =============================================================================
-
 # Model checkpoint
-# MODEL_PATH="/home/najo/NAS/DIP/DINObotPose2/Train/outputs/dinov3_base_20260226_161726/best_model.pth"
-MODEL_PATH="/data/public/NAS/DINObotPose2/Train/outputs/dinov3_base_20260228_161218/best_model.pth"
+MODEL_PATH="/data/public/NAS/DINObotPose2/Train/outputs/dinov3_base_20260301_124538/best_model.pth"
 
-# Input annotation JSON (contains image_path + GT keypoints + camera K)
-JSON_PATH="/data/public/NAS/DINObotPose2/Dataset/Converted_dataset/DREAM_to_DREAM/panda-3cam_azure/002865.json"
-# JSON_PATH="/home/najo/NAS/DIP/2025_ICRA_Multi_View_Robot_Pose_Estimation/dataset/Converted_dataset/DREAM_to_DREAM/panda-3cam_azure/000000.json"
+# Input annotation JSON (contains image path + GT keypoints + camera K)
+JSON_PATH="/data/public/NAS/DINObotPose2/Dataset/Converted_dataset/DREAM_to_DREAM/panda-3cam_azure/000000.json"
 
 # Output directory
 OUTPUT_DIR="${SCRIPT_DIR}/real_inference_output"
 
-# =============================================================================
-# Run Inference
-# =============================================================================
+# Inference options
+PRED_3D_SOURCE="fk_robopepp"
+ROBOPEPP_FIX_JOINT7_ZERO=1
+PNP_MODE="epnp"  # epnp (baseline) | loo_epnp (alternative) | ransac
+PNP_TOPK=6
+PNP_RANSAC_REPROJ_ERROR=5.0
+KP_MIN_CONFIDENCE=0.5  # mask low-confidence 2D keypoints as invalid (-999)
+KP_MIN_PEAK_LOGIT=0.25  # mask low-peak heatmap keypoints as invalid (-999)
+PNP_REPROJ_OUTLIER_THRESH=12.0  # reject high-reprojection-error points and refit
+PNP_MIN_SPAN_PX=20.0  # reject PnP if selected points are too concentrated
+PNP_MIN_AREA_RATIO=0.001
+FILL_INVALID_2D_WITH_FK_REPROJ=1  # fill low-reliability 2D with FK reprojection after successful PnP
 
 echo "=========================================="
 echo "  Real Image Inference (GT vs Prediction)"
@@ -32,6 +31,12 @@ echo "=========================================="
 echo "  Model: ${MODEL_PATH}"
 echo "  JSON:  ${JSON_PATH}"
 echo "  Output: ${OUTPUT_DIR}"
+echo "  PnP mode: ${PNP_MODE}"
+echo "  Keypoint min confidence: ${KP_MIN_CONFIDENCE}"
+echo "  Keypoint min peak logit: ${KP_MIN_PEAK_LOGIT}"
+echo "  PnP reproj outlier threshold: ${PNP_REPROJ_OUTLIER_THRESH}px"
+echo "  PnP min span: ${PNP_MIN_SPAN_PX}px, min area ratio: ${PNP_MIN_AREA_RATIO}"
+echo "  RoboPEPP joint7=0: ${ROBOPEPP_FIX_JOINT7_ZERO}"
 echo ""
 
 if [[ "${JSON_PATH}" != *.json ]]; then
@@ -42,7 +47,18 @@ fi
 python "${SCRIPT_DIR}/inference_with_real.py" \
     -j "${JSON_PATH}" \
     -p "${MODEL_PATH}" \
-    -o "${OUTPUT_DIR}"
+    -o "${OUTPUT_DIR}" \
+    --pred-3d-source "${PRED_3D_SOURCE}" \
+    $( [[ "${ROBOPEPP_FIX_JOINT7_ZERO}" == "1" ]] && echo "--robopepp-fix-joint7-zero" ) \
+    --pnp-mode "${PNP_MODE}" \
+    --pnp-topk "${PNP_TOPK}" \
+    --pnp-ransac-reproj-error "${PNP_RANSAC_REPROJ_ERROR}" \
+    --pnp-reproj-outlier-thresh "${PNP_REPROJ_OUTLIER_THRESH}" \
+    --pnp-min-span-px "${PNP_MIN_SPAN_PX}" \
+    --pnp-min-area-ratio "${PNP_MIN_AREA_RATIO}" \
+    --kp-min-peak-logit "${KP_MIN_PEAK_LOGIT}" \
+    --kp-min-confidence "${KP_MIN_CONFIDENCE}" \
+    $( [[ "${FILL_INVALID_2D_WITH_FK_REPROJ}" == "1" ]] && echo "--fill-invalid-2d-with-fk-reproj" )
 
 echo ""
 echo "Results saved to: ${OUTPUT_DIR}"

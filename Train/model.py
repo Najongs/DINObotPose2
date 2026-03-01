@@ -367,7 +367,7 @@ def panda_forward_kinematics(joint_angles):
 
 class JointAngleHead(nn.Module):
     """
-    Predicts 7 joint angles for Panda robot from visual features + heatmaps.
+    Predicts Panda joint angles (6 or 7 DoF) from visual features + heatmaps.
     Uses FK to produce 3D keypoints in robot base frame.
     """
 
@@ -378,12 +378,13 @@ class JointAngleHead(nn.Module):
         self.hidden_dim = 256
         self.use_joint_embedding = use_joint_embedding
 
-        # Joint limits as buffers
+        # Joint limits as buffers (optionally use only first 6 for RoboPEPP-style mode)
         limits = torch.tensor(_PANDA_JOINT_LIMITS, dtype=torch.float32)  # (7, 2)
-        self.register_buffer('joint_lower', limits[:, 0])  # (7,)
-        self.register_buffer('joint_upper', limits[:, 1])  # (7,)
-        self.register_buffer('joint_mid', (limits[:, 0] + limits[:, 1]) / 2)  # (7,)
-        self.register_buffer('joint_range', (limits[:, 1] - limits[:, 0]) / 2)  # (7,)
+        limits = limits[:self.num_angles]
+        self.register_buffer('joint_lower', limits[:, 0])
+        self.register_buffer('joint_upper', limits[:, 1])
+        self.register_buffer('joint_mid', (limits[:, 0] + limits[:, 1]) / 2)
+        self.register_buffer('joint_range', (limits[:, 1] - limits[:, 0]) / 2)
 
         # Learnable temperature for soft-argmax
         self.temperature = nn.Parameter(torch.tensor(10.0))
@@ -411,17 +412,25 @@ class JointAngleHead(nn.Module):
         )
         self.joint_relation_net = nn.TransformerEncoder(encoder_layer, num_layers=2)
 
-        # 3. Global state → 7 angles at once
-        # After self-attention, mean-pool all joint tokens into a single robot state vector,
-        # then predict all 7 joint angles together.
-        # This is kinematically correct: joint angles are a global property of the robot
-        # configuration, not independently decodable from individual keypoint tokens.
-        self.angle_predictor = nn.Sequential(
+        # 3. Global angle decoding (stable baseline).
+        self.global_angle_predictor = nn.Sequential(
             nn.Linear(self.hidden_dim, 256),
             nn.GELU(),
             nn.LayerNorm(256),
-            nn.Linear(256, self.num_angles)  # Predict all 7 angles at once
+            nn.Linear(256, self.num_angles)
         )
+
+        # 4. Per-joint residual correction after contextual interaction.
+        self.per_joint_residual_head = nn.Sequential(
+            nn.Linear(self.hidden_dim, 128),
+            nn.GELU(),
+            nn.LayerNorm(128),
+            nn.Linear(128, 1)
+        )
+        # Safety path when num_joints != num_angles (keeps API generic).
+        self.residual_mixer = nn.Identity() if self.num_joints == self.num_angles else nn.Linear(self.num_joints, self.num_angles)
+        # Small learnable gate keeps residual branch from destabilizing early training.
+        self.residual_scale = nn.Parameter(torch.tensor(0.1))
 
     def forward(self, dino_features, predicted_heatmaps):
         """
@@ -429,7 +438,7 @@ class JointAngleHead(nn.Module):
             dino_features: (B, N, D) backbone patch tokens
             predicted_heatmaps: (B, NUM_JOINTS, H, W) 2D belief maps
         Returns:
-            joint_angles: (B, 7) predicted joint angles (radians, within limits)
+            joint_angles: (B, num_angles) predicted joint angles (radians, within limits)
             keypoints_3d_robot: (B, 7, 3) FK-computed 3D keypoints in robot base frame
         """
         b, n, d = dino_features.shape
@@ -481,17 +490,27 @@ class JointAngleHead(nn.Module):
         # Self-attention for kinematic constraint learning
         related = self.joint_relation_net(refined)  # (B, NJ, 256)
 
-        # Global pooling: aggregate all joint tokens into single robot state
+        # Global decoding from integrated robot state.
         global_state = related.mean(dim=1)  # (B, 256)
+        raw_global = self.global_angle_predictor(global_state)  # (B, num_angles)
 
-        # Predict all 7 joint angles from global robot state
-        raw_angles = self.angle_predictor(global_state)  # (B, 7)
+        # Per-joint residual correction (context-aware due to self-attention).
+        raw_residual = self.per_joint_residual_head(related).squeeze(-1)  # (B, NJ)
+        raw_residual = self.residual_mixer(raw_residual)  # (B, num_angles)
+        residual_scale = torch.sigmoid(self.residual_scale)  # (0, 1)
+        raw_angles = raw_global + residual_scale * torch.tanh(raw_residual)
 
         # Apply joint limits via tanh scaling: mid + tanh(raw) * range
         joint_angles = self.joint_mid.unsqueeze(0) + torch.tanh(raw_angles) * self.joint_range.unsqueeze(0)
 
-        # Forward kinematics
-        keypoints_3d_robot = panda_forward_kinematics(joint_angles)  # (B, 7, 3)
+        # Forward kinematics always expects 7-DoF Panda vector.
+        # In 6-DoF mode we append fixed joint7=0.
+        if self.num_angles < 7:
+            pad = torch.zeros((joint_angles.shape[0], 7 - self.num_angles), device=joint_angles.device, dtype=joint_angles.dtype)
+            joint_angles_fk = torch.cat([joint_angles, pad], dim=1)
+        else:
+            joint_angles_fk = joint_angles
+        keypoints_3d_robot = panda_forward_kinematics(joint_angles_fk)  # (B, 7, 3)
 
         return joint_angles, keypoints_3d_robot
 
@@ -791,10 +810,12 @@ class IterativeRefinementModule(nn.Module):
 class DINOv3PoseEstimator(nn.Module):
     def __init__(self, dino_model_name, heatmap_size, unfreeze_blocks=2,
                  use_joint_embedding=False,
-                 use_iterative_refinement=False, refinement_iterations=3):
+                 use_iterative_refinement=False, refinement_iterations=3,
+                 fix_joint7_zero=False):
         super().__init__()
         self.dino_model_name = dino_model_name
         self.heatmap_size = heatmap_size  # (H, W) tuple
+        self.fix_joint7_zero = fix_joint7_zero
         # Iterative refinement path is intentionally disabled to keep training/inference simple.
         self.use_iterative_refinement = False
         self.backbone = DINOv3Backbone(dino_model_name, unfreeze_blocks=unfreeze_blocks)
@@ -816,7 +837,7 @@ class DINOv3PoseEstimator(nn.Module):
         self.joint_angle_head = JointAngleHead(
             input_dim=feature_dim,
             num_joints=NUM_JOINTS,
-            num_angles=7,
+            num_angles=6 if self.fix_joint7_zero else 7,
             use_joint_embedding=use_joint_embedding
         )
 
@@ -851,11 +872,16 @@ class DINOv3PoseEstimator(nn.Module):
         predicted_heatmaps = self.keypoint_head(dino_features)
 
         # 3. Predict joint angles → FK → robot-frame 3D keypoints
-        joint_angles, kpts_3d_fk = self.joint_angle_head(
+        joint_angles_pred, kpts_3d_fk = self.joint_angle_head(
             dino_features, predicted_heatmaps
         )
-        current_angles = joint_angles
+        current_angles = joint_angles_pred
         current_kp3d_fk = kpts_3d_fk
+        if self.fix_joint7_zero and current_angles.shape[1] >= 7:
+            # RoboPEPP-style convention: treat joint7 as fixed and only learn/use first 6 joints.
+            current_angles = current_angles.clone()
+            current_angles[:, 6] = 0.0
+            current_kp3d_fk = panda_forward_kinematics(current_angles)
 
         # 4. Optional iterative refinement on angle/FK branch (disabled in simplified mode)
         result = {}

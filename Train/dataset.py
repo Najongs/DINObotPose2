@@ -7,6 +7,7 @@ import os
 import json
 import random
 import glob
+from pathlib import Path
 import numpy as np
 from PIL import Image as PILImage
 import torch
@@ -114,6 +115,10 @@ class PoseEstimationDataset(Dataset):
         fda_real_dir: Optional[str] = None,  # Real image directory for FDA augmentation
         fda_beta: float = 0.01,  # FDA low-frequency replacement ratio
         fda_prob: float = 0.5,  # Probability of applying FDA per sample
+        occlusion_prob: float = 0.0,  # Probability of synthetic occlusion augmentation
+        occlusion_max_holes: int = 6,  # Max number of coarse occlusion patches
+        occlusion_max_size_frac: float = 0.2,  # Max occluder size relative to image side
+        json_allowlist_path: Optional[str] = None,  # Optional list file (txt/json) to keep only selected json frames
     ):
         """
         Args:
@@ -130,6 +135,10 @@ class PoseEstimationDataset(Dataset):
             fda_real_dir: Real 이미지 디렉토리 (FDA style source, label 불필요)
             fda_beta: FDA 저주파 교체 비율 (0.01=미세한 톤 변화, 0.05=강한 변환)
             fda_prob: FDA 적용 확률 (0.5 = 50%의 샘플에 적용)
+            occlusion_prob: 가려짐 증강(CoarseDropout) 적용 확률
+            occlusion_max_holes: 최대 가림 패치 개수
+            occlusion_max_size_frac: 가림 패치 최대 크기 비율(이미지 변 길이 대비)
+            json_allowlist_path: 선택된 frame json 이름/경로 리스트 파일(txt/json)
         """
         self.data_dir = data_dir
         self.keypoint_names = keypoint_names
@@ -142,6 +151,11 @@ class PoseEstimationDataset(Dataset):
         self.robot_types = robot_types
         self.fda_beta = fda_beta
         self.fda_prob = fda_prob
+        self.occlusion_prob = occlusion_prob
+        self.occlusion_max_holes = max(1, int(occlusion_max_holes))
+        self.occlusion_max_size_frac = max(0.01, float(occlusion_max_size_frac))
+        self.json_allowlist_path = json_allowlist_path
+        self.json_allowlist_keys = self._load_json_allowlist(json_allowlist_path)
 
         # FDA: Load real image paths for style transfer
         self.fda_real_paths = []
@@ -175,9 +189,19 @@ class PoseEstimationDataset(Dataset):
 
         # 데이터 증강 설정
         if self.augment:
+            # Occlusion robustness: hide random regions while keeping keypoint supervision.
+            occ_max_frac = max(0.05, min(0.6, float(self.occlusion_max_size_frac)))
+            occ_min_frac = min(0.04, occ_max_frac)
             self.augmentation = albu.Compose([
                 albu.GaussNoise(p=0.3),
                 albu.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=0.5),
+                albu.CoarseDropout(
+                    num_holes_range=(1, self.occlusion_max_holes),
+                    hole_height_range=(occ_min_frac, occ_max_frac),
+                    hole_width_range=(occ_min_frac, occ_max_frac),
+                    fill=0,
+                    p=self.occlusion_prob,
+                ),
                 albu.ShiftScaleRotate(
                     shift_limit=0.1,
                     scale_limit=0.1,
@@ -186,6 +210,89 @@ class PoseEstimationDataset(Dataset):
                 ),
                 albu.HueSaturationValue(p=0.3),
             ], keypoint_params=albu.KeypointParams(format='xy', remove_invisible=False))
+
+    @staticmethod
+    def _normalize_path_token(path_str: str) -> str:
+        return os.path.normpath(path_str).replace('\\', '/').lower()
+
+    def _load_json_allowlist(self, allowlist_path: Optional[str]) -> Optional[set]:
+        if not allowlist_path:
+            return None
+
+        if not os.path.exists(allowlist_path):
+            raise FileNotFoundError(f"json allowlist not found: {allowlist_path}")
+
+        keys = set()
+        suffix = Path(allowlist_path).suffix.lower()
+
+        def add_key(token: str):
+            token = str(token).strip()
+            if not token:
+                return
+            keys.add(self._normalize_path_token(token))
+            name = os.path.basename(token)
+            if name:
+                keys.add(name.lower())
+                stem = os.path.splitext(name)[0]
+                if stem:
+                    keys.add(stem.lower())
+
+        if suffix == '.json':
+            with open(allowlist_path, 'r') as f:
+                payload = json.load(f)
+
+            if isinstance(payload, list):
+                for item in payload:
+                    if isinstance(item, str):
+                        add_key(item)
+                    elif isinstance(item, dict):
+                        for field in ('json_path', 'json_name', 'name'):
+                            if field in item and item[field]:
+                                add_key(item[field])
+            elif isinstance(payload, dict):
+                for field in ('json_paths', 'json_names', 'items'):
+                    val = payload.get(field)
+                    if isinstance(val, list):
+                        for item in val:
+                            if isinstance(item, str):
+                                add_key(item)
+                            elif isinstance(item, dict):
+                                for f2 in ('json_path', 'json_name', 'name'):
+                                    if f2 in item and item[f2]:
+                                        add_key(item[f2])
+            else:
+                raise ValueError(f"Unsupported allowlist JSON format: {allowlist_path}")
+        else:
+            with open(allowlist_path, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith('#'):
+                        continue
+                    add_key(line)
+
+        if not keys:
+            raise ValueError(f"json allowlist is empty: {allowlist_path}")
+
+        print(f"JSON allowlist loaded: {allowlist_path} ({len(keys)} match keys)")
+        return keys
+
+    def _is_json_allowed(self, json_path: str, json_file: str) -> bool:
+        if self.json_allowlist_keys is None:
+            return True
+
+        p = Path(json_path)
+        candidates = {
+            self._normalize_path_token(json_path),
+            self._normalize_path_token(str(p.resolve())),
+            json_file.lower(),
+            p.stem.lower(),
+        }
+        try:
+            rel = p.resolve().relative_to(Path(self.data_dir).resolve())
+            candidates.add(self._normalize_path_token(str(rel)))
+        except Exception:
+            pass
+        return any(c in self.json_allowlist_keys for c in candidates)
 
     def _load_dataset(self) -> List[Dict]:
         """NDDS 데이터셋에서 샘플 리스트 로드"""
@@ -264,6 +371,8 @@ class PoseEstimationDataset(Dataset):
 
             for json_file in json_files:
                 json_path = os.path.join(root, json_file)
+                if not self._is_json_allowed(json_path, json_file):
+                    continue
                 base_name = json_file.replace('.json', '')
                 img_path = None
 
@@ -473,6 +582,7 @@ class PoseEstimationDataset(Dataset):
             'valid_mask': valid_mask,
             'robot_type': torch.tensor(robot_type, dtype=torch.long),
             'name': sample_info['name'],
+            'annotation_path': sample_info['annotation_path'],
             'camera_K': camera_K,
             'original_size': torch.tensor([original_size[0], original_size[1]], dtype=torch.float32),  # (W, H)
         }
@@ -481,9 +591,11 @@ class PoseEstimationDataset(Dataset):
         if self.include_angles and 'angles' in keypoints_data:
             angles = keypoints_data['angles']
             sample['angles'] = torch.from_numpy(angles).float()
+            sample['has_angles'] = torch.tensor(True, dtype=torch.bool)
         else:
             # Dummy angles (모델이 angle 출력을 요구하는 경우)
             sample['angles'] = torch.zeros(7).float()  # 7 joint angles for Panda
+            sample['has_angles'] = torch.tensor(False, dtype=torch.bool)
 
         return sample
 

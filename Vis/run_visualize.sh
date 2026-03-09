@@ -7,18 +7,18 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
-DATA_DIR="${ROOT_DIR}/Dataset/Converted_dataset/DREAM_to_DREAM_syn/panda_synth_test_photo"
+DATA_DIR="${ROOT_DIR}/Dataset/Converted_dataset/DREAM_to_DREAM/panda-3cam_azure"
 OUTPUT_DIR="${ROOT_DIR}/Vis/qualitative_output"
 
-MODEL_PATH="/data/public/NAS/DINObotPose2/Train/outputs/dinov3_base_20260301_011937/best_model.pth"
+MODEL_PATH="/data/public/NAS/DINObotPose2/Train/outputs/dinov3_base_20260302_152637/best_model.pth"
 if [[ $# -ge 1 ]]; then
     MODEL_PATH="$1"
 fi
 # Pick representative samples (edit as needed)
 JSON_FILES=(
-    "${DATA_DIR}/000001.json"
-    "${DATA_DIR}/000638.json"
-    "${DATA_DIR}/001000.json"
+    "${DATA_DIR}/000000.json"
+    "${DATA_DIR}/000777.json"
+    "${DATA_DIR}/001777.json"
 )
 
 for jf in "${JSON_FILES[@]}"; do
@@ -34,13 +34,13 @@ if [[ ! -f "${MODEL_PATH}" ]]; then
     echo "[ERROR] Model not found: ${MODEL_PATH}"
     exit 1
 fi
-USE_MESH="${USE_MESH:-0}"
+USE_MESH="${USE_MESH:-1}"
 KP_MIN_CONFIDENCE="${KP_MIN_CONFIDENCE:-0.20}"
 if [[ "${USE_MESH}" == "1" ]]; then
-    echo "[INFO] Running visualization with mesh overlay (IK enabled)"
+    echo "[INFO] Running visualization with mesh overlay (pred joint angles preferred; IK fallback)"
     MESH_FLAG=()
 else
-    echo "[INFO] Running visualization (skeleton + 3D metrics, mesh disabled by default)"
+    echo "[INFO] Running visualization (skeleton + 3D metrics, mesh disabled)"
     MESH_FLAG=(--no-mesh)
 fi
 

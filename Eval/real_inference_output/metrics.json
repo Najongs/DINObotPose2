@@ -1,27 +1,27 @@
 {
-  "panda_link0_2d_px": 3.206895589828491,
-  "panda_link2_2d_px": 2.5664429664611816,
-  "panda_link3_2d_px": 6.5697503089904785,
-  "panda_link4_2d_px": 3.910586357116699,
-  "panda_link6_2d_px": 2.4425132274627686,
-  "panda_link7_2d_px": 0.9902666211128235,
-  "panda_hand_2d_px": 1.3983114957809448,
-  "mean_2d_px": 3.0121092796325684,
-  "max_2d_px": 6.5697503089904785,
-  "median_2d_px": 2.5664429664611816,
-  "panda_link0_3d_m": 0.02535001406888253,
-  "panda_link2_3d_m": 0.03269017352917421,
-  "panda_link3_3d_m": 0.03135399407995508,
-  "panda_link4_3d_m": 0.03211848358918859,
-  "panda_link6_3d_m": 0.034912023736595986,
-  "panda_link7_3d_m": 0.035589564992563924,
-  "panda_hand_3d_m": 0.03551650567123946,
-  "mean_3d_m": 0.03250439423822853,
-  "max_3d_m": 0.035589564992563924,
-  "median_3d_m": 0.03269017352917421,
-  "mean_2d_norm": 0.37651365995407104,
-  "json_path": "/data/public/NAS/DINObotPose2/Dataset/Converted_dataset/DREAM_to_DREAM/panda-3cam_azure/000000.json",
-  "image_path": "/data/public/NAS/DINObotPose2/Dataset/DREAM_real/panda-3cam_azure/panda-3cam_azure/000000.rgb.jpg",
+  "panda_link0_2d_px": 0.9217132329940796,
+  "panda_link2_2d_px": 1.4000179767608643,
+  "panda_link3_2d_px": 5.397575855255127,
+  "panda_link4_2d_px": 0.9157091975212097,
+  "panda_link6_2d_px": 2.0059592723846436,
+  "panda_link7_2d_px": 2.3662683963775635,
+  "panda_hand_2d_px": 3.4755260944366455,
+  "mean_2d_px": 2.3546814918518066,
+  "max_2d_px": 5.397575855255127,
+  "median_2d_px": 2.0059592723846436,
+  "panda_link0_3d_m": 0.009704956459777484,
+  "panda_link2_3d_m": 0.011358531146121207,
+  "panda_link3_3d_m": 0.009683906968374678,
+  "panda_link4_3d_m": 0.00915327759030322,
+  "panda_link6_3d_m": 0.00996349562396057,
+  "panda_link7_3d_m": 0.010377074699133813,
+  "panda_hand_3d_m": 0.009402932742223542,
+  "mean_3d_m": 0.00994916788998493,
+  "max_3d_m": 0.011358531146121207,
+  "median_3d_m": 0.009704956459777484,
+  "mean_2d_norm": 0.29433518648147583,
+  "json_path": "/data/public/NAS/DINObotPose2/Dataset/Converted_dataset/DREAM_to_DREAM/panda-3cam_azure/000602.json",
+  "image_path": "/data/public/NAS/DINObotPose2/Dataset/DREAM_real/panda-3cam_azure/panda-3cam_azure/000602.rgb.jpg",
   "ignored_keypoints": {
     "low_peak_logit": [],
     "low_conf": [],
@@ -45,39 +45,39 @@
     "removed_reproj_keypoints": [],
     "spread_ok": true,
     "spread_span_xy_px": [
-      176.25,
-      232.5
+      131.25,
+      210.0
     ],
-    "spread_area_ratio": 0.1312159805481915
+    "spread_area_ratio": 0.08825783180317616
   },
   "heatmap_peak": {
     "panda_link0": {
-      "peak_logit": 0.8371498584747314,
-      "peak_sigmoid": 0.6978645920753479
+      "peak_logit": 0.8361726403236389,
+      "peak_sigmoid": 0.6976584792137146
     },
     "panda_link2": {
-      "peak_logit": 0.9054335355758667,
-      "peak_sigmoid": 0.7120648622512817
+      "peak_logit": 0.37224501371383667,
+      "peak_sigmoid": 0.5920013189315796
     },
     "panda_link3": {
-      "peak_logit": 0.8578594923019409,
-      "peak_sigmoid": 0.7022132873535156
+      "peak_logit": 0.3005003035068512,
+      "peak_sigmoid": 0.5745648145675659
     },
     "panda_link4": {
-      "peak_logit": 0.9059948325157166,
-      "peak_sigmoid": 0.7121798992156982
+      "peak_logit": 0.5820239782333374,
+      "peak_sigmoid": 0.6415330171585083
     },
     "panda_link6": {
-      "peak_logit": 0.9846941232681274,
-      "peak_sigmoid": 0.7280386090278625
+      "peak_logit": 0.5212357640266418,
+      "peak_sigmoid": 0.6274366974830627
     },
     "panda_link7": {
-      "peak_logit": 0.9598841667175293,
-      "peak_sigmoid": 0.723098635673523
+      "peak_logit": 0.6803884506225586,
+      "peak_sigmoid": 0.6638254523277283
     },
     "panda_hand": {
-      "peak_logit": 0.9519555568695068,
-      "peak_sigmoid": 0.721508264541626
+      "peak_logit": 0.6229424476623535,
+      "peak_sigmoid": 0.6508874893188477
     }
   }
 }

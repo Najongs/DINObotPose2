@@ -4,10 +4,10 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Model checkpoint
-MODEL_PATH="/data/public/NAS/DINObotPose2/Train/outputs/dinov3_base_20260301_124538/best_model.pth"
+MODEL_PATH="/data/public/NAS/DINObotPose2/Train/outputs/dinov3_base_20260302_190422/best_model.pth"
 
 # Input annotation JSON (contains image path + GT keypoints + camera K)
-JSON_PATH="/data/public/NAS/DINObotPose2/Dataset/Converted_dataset/DREAM_to_DREAM/panda-3cam_azure/000000.json"
+JSON_PATH="/data/public/NAS/DINObotPose2/Dataset/Converted_dataset/DREAM_to_DREAM/panda-3cam_azure/000602.json"
 
 # Output directory
 OUTPUT_DIR="${SCRIPT_DIR}/real_inference_output"
@@ -18,7 +18,7 @@ ROBOPEPP_FIX_JOINT7_ZERO=1
 PNP_MODE="epnp"  # epnp (baseline) | loo_epnp (alternative) | ransac
 PNP_TOPK=6
 PNP_RANSAC_REPROJ_ERROR=5.0
-KP_MIN_CONFIDENCE=0.5  # mask low-confidence 2D keypoints as invalid (-999)
+KP_MIN_CONFIDENCE=0.25  # mask low-confidence 2D keypoints as invalid (-999)
 KP_MIN_PEAK_LOGIT=0.25  # mask low-peak heatmap keypoints as invalid (-999)
 PNP_REPROJ_OUTLIER_THRESH=12.0  # reject high-reprojection-error points and refit
 PNP_MIN_SPAN_PX=20.0  # reject PnP if selected points are too concentrated

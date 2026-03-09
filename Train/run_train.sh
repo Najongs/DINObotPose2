@@ -8,7 +8,8 @@
 # =============================================================================
 
 # Data paths (REQUIRED - Update these paths!)
-DATA_DIR="/data/public/NAS/DINObotPose2/Dataset/Converted_dataset/DREAM_to_DREAM"  # Training data directory
+# Multiple training roots are supported: DATA_DIRS=("/path/A" "/path/B")
+DATA_DIRS=("/data/public/NAS/DINObotPose2/Dataset/Converted_dataset/DREAM_to_DREAM")  # Training data directories
 VAL_DIR="/data/public/NAS/DINObotPose2/Dataset/Converted_dataset/DREAM_to_DREAM/panda-3cam_azure"  
 
 # DATA_DIR="/home/najo/NAS/DIP/2025_ICRA_Multi_View_Robot_Pose_Estimation/dataset/Converted_dataset/DREAM_to_DREAM_syn/panda_synth_train_dr"  # Training data directory
@@ -47,17 +48,17 @@ REFINEMENT_ITERATIONS=3        # Number of refinement iterations
 REFINEMENT_WEIGHT=50.0         # Refinement loss weight
 
 # Loss weights
-HEATMAP_WEIGHT=1.0
+HEATMAP_WEIGHT=1000.0
 KP3D_WEIGHT=100.0
-HEATMAP_ONLY_TRAIN=True  # True: train only 2D heatmap branch
+HEATMAP_ONLY_TRAIN=False  # True: train only 2D heatmap branch
 
 # FDA (Fourier Domain Adaptation) for sim-to-real
 FDA_REAL_DIR="/data/public/NAS/DINObotPose2/Dataset/DREAM_real"  # Real images (no labels needed)
 # FDA_REAL_DIR="/home/najo/NAS/DIP/2025_ICRA_Multi_View_Robot_Pose_Estimation/dataset/DREAM_real"
 FDA_BETA=0.001   # Low-freq replacement ratio (0.01=subtle tone shift, 0.05=strong)
 FDA_PROB=0.0    # Probability of applying FDA per sample (0.0 to disable)
-OCCLUSION_PROB=0.4          # CoarseDropout probability for occlusion robustness
-OCCLUSION_MAX_HOLES=6       # Maximum occlusion patches per image
+OCCLUSION_PROB=0.2          # CoarseDropout probability for occlusion robustness
+OCCLUSION_MAX_HOLES=3       # Maximum occlusion patches per image
 OCCLUSION_MAX_SIZE_FRAC=0.2 # Max patch size ratio (image side fraction)
 
 # Training hyperparameters
@@ -88,7 +89,7 @@ WANDB_RUN_NAME="dinov3_base_$(date +%Y%m%d_%H%M%S)"
 
 # Other settings
 SEED=42
-RESUME="/data/public/NAS/DINObotPose2/Train/outputs/*dinov3_base_20260228_013413/*best_model_syn_2d.pth"  # Path to checkpoint for resuming (leave empty for new training)
+RESUME="/data/public/NAS/DINObotPose2/Train/outputs/dinov3_base_20260302_152637/epoch_12.pth"  # Path to checkpoint for resuming (leave empty for new training)
 RESUME_LR=""  # Learning rate to use when resuming (leave empty for automatic calculation from scheduler)
 LOAD_2D_HEAD=""  # Path to checkpoint for loading pretrained 2D heatmap head (leave empty to train from scratch)
 FREEZE_2D_HEAD_EPOCHS=50  # If LOAD_2D_HEAD is set, freeze loaded 2D head for first N epochs then unfreeze
@@ -146,9 +147,21 @@ else
     HARD_REPLAY_FLAG="--no-hard-replay"
 fi
 
+# Validate training directories
+if [ ${#DATA_DIRS[@]} -eq 0 ]; then
+    echo "Error: DATA_DIRS is empty. Set at least one training directory."
+    exit 1
+fi
+for d in "${DATA_DIRS[@]}"; do
+    if [ ! -d "${d}" ]; then
+        echo "Error: Training directory does not exist: ${d}"
+        exit 1
+    fi
+done
+
 # Base args shared by all phases
 COMMON_ARGS="\
-    --data-dir ${DATA_DIR} \
+    --data-dir ${DATA_DIRS[*]} \
     --train-split ${TRAIN_SPLIT} \
     --model-name ${MODEL_NAME} \
     --image-size ${IMAGE_SIZE} \
@@ -226,6 +239,10 @@ run_training_phase() {
     echo "============================================================"
     echo "Phase: ${phase_name}"
     echo "Output directory: ${phase_output_dir}"
+    echo "Train data dirs:"
+    for d in "${DATA_DIRS[@]}"; do
+        echo "  - ${d}"
+    done
     echo "Train JSON list: ${phase_train_json_list:-<none>}"
     echo "============================================================"
 

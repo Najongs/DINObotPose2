@@ -1738,9 +1738,16 @@ def main(args):
         'panda_link4', 'panda_link6', 'panda_link7', 'panda_hand'
     ]
 
+    train_data_dirs = args.data_dir if isinstance(args.data_dir, list) else [args.data_dir]
+
     # Create dataloaders
     if is_main_process:
-        print(f"\nLoading datasets from: {args.data_dir}")
+        if len(train_data_dirs) == 1:
+            print(f"\nLoading datasets from: {train_data_dirs[0]}")
+        else:
+            print("\nLoading datasets from multiple training directories:")
+            for d in train_data_dirs:
+                print(f"  - {d}")
 
     train_list_for_main = args.train_json_list if args.train_json_list_mode == 'filter' else None
     train_focus_loader = None
@@ -1751,22 +1758,27 @@ def main(args):
         from dataset import PoseEstimationDataset
         import torch.utils.data as tud
 
-        train_dataset = PoseEstimationDataset(
-            data_dir=args.data_dir,
-            keypoint_names=keypoint_names,
-            image_size=(args.image_size, args.image_size),
-            heatmap_size=(args.heatmap_size, args.heatmap_size),
-            augment=True,
-            multi_robot=args.multi_robot,
-            robot_types=args.robot_types,
-            fda_real_dir=args.fda_real_dir,
-            fda_beta=args.fda_beta,
-            fda_prob=args.fda_prob,
-            occlusion_prob=args.occlusion_prob,
-            occlusion_max_holes=args.occlusion_max_holes,
-            occlusion_max_size_frac=args.occlusion_max_size_frac,
-            json_allowlist_path=train_list_for_main,
-        )
+        train_datasets = []
+        for data_dir in train_data_dirs:
+            train_datasets.append(
+                PoseEstimationDataset(
+                    data_dir=data_dir,
+                    keypoint_names=keypoint_names,
+                    image_size=(args.image_size, args.image_size),
+                    heatmap_size=(args.heatmap_size, args.heatmap_size),
+                    augment=True,
+                    multi_robot=args.multi_robot,
+                    robot_types=args.robot_types,
+                    fda_real_dir=args.fda_real_dir,
+                    fda_beta=args.fda_beta,
+                    fda_prob=args.fda_prob,
+                    occlusion_prob=args.occlusion_prob,
+                    occlusion_max_holes=args.occlusion_max_holes,
+                    occlusion_max_size_frac=args.occlusion_max_size_frac,
+                    json_allowlist_path=train_list_for_main,
+                )
+            )
+        train_dataset = train_datasets[0] if len(train_datasets) == 1 else tud.ConcatDataset(train_datasets)
 
         val_dataset_full = PoseEstimationDataset(
             data_dir=args.val_dir,
@@ -1783,22 +1795,27 @@ def main(args):
         )
 
         if args.train_json_list and args.train_json_list_mode == 'extra':
-            train_focus_dataset = PoseEstimationDataset(
-                data_dir=args.data_dir,
-                keypoint_names=keypoint_names,
-                image_size=(args.image_size, args.image_size),
-                heatmap_size=(args.heatmap_size, args.heatmap_size),
-                augment=True,
-                multi_robot=args.multi_robot,
-                robot_types=args.robot_types,
-                fda_real_dir=args.fda_real_dir,
-                fda_beta=args.fda_beta,
-                fda_prob=args.fda_prob,
-                occlusion_prob=args.occlusion_prob,
-                occlusion_max_holes=args.occlusion_max_holes,
-                occlusion_max_size_frac=args.occlusion_max_size_frac,
-                json_allowlist_path=args.train_json_list,
-            )
+            train_focus_datasets = []
+            for data_dir in train_data_dirs:
+                train_focus_datasets.append(
+                    PoseEstimationDataset(
+                        data_dir=data_dir,
+                        keypoint_names=keypoint_names,
+                        image_size=(args.image_size, args.image_size),
+                        heatmap_size=(args.heatmap_size, args.heatmap_size),
+                        augment=True,
+                        multi_robot=args.multi_robot,
+                        robot_types=args.robot_types,
+                        fda_real_dir=args.fda_real_dir,
+                        fda_beta=args.fda_beta,
+                        fda_prob=args.fda_prob,
+                        occlusion_prob=args.occlusion_prob,
+                        occlusion_max_holes=args.occlusion_max_holes,
+                        occlusion_max_size_frac=args.occlusion_max_size_frac,
+                        json_allowlist_path=args.train_json_list,
+                    )
+                )
+            train_focus_dataset = train_focus_datasets[0] if len(train_focus_datasets) == 1 else tud.ConcatDataset(train_focus_datasets)
             if is_distributed:
                 train_focus_sampler = DistributedSampler(train_focus_dataset, num_replicas=world_size, rank=rank, shuffle=True)
             else:
@@ -1846,10 +1863,15 @@ def main(args):
     else:
         if args.val_json_list:
             raise ValueError("--val-json-list requires --val-dir. Without --val-dir, only --train-json-list is supported.")
+        if len(train_data_dirs) > 1:
+            raise ValueError(
+                "Multiple --data-dir values currently require --val-dir. "
+                "Please set --val-dir or pass a single --data-dir."
+            )
         # Create separate train and val datasets with different augmentation settings
         # This is more robust than modifying augment flag after random_split
         base_dataset = PoseEstimationDataset(
-            data_dir=args.data_dir,
+            data_dir=train_data_dirs[0],
             keypoint_names=keypoint_names,
             image_size=(args.image_size, args.image_size),
             heatmap_size=(args.heatmap_size, args.heatmap_size),
@@ -1873,7 +1895,7 @@ def main(args):
 
         # Create train dataset with augmentation
         train_dataset_full = PoseEstimationDataset(
-            data_dir=args.data_dir,
+            data_dir=train_data_dirs[0],
             keypoint_names=keypoint_names,
             image_size=(args.image_size, args.image_size),
             heatmap_size=(args.heatmap_size, args.heatmap_size),
@@ -1890,7 +1912,7 @@ def main(args):
 
         # Create val dataset without augmentation
         val_dataset_full = PoseEstimationDataset(
-            data_dir=args.data_dir,
+            data_dir=train_data_dirs[0],
             keypoint_names=keypoint_names,
             image_size=(args.image_size, args.image_size),
             heatmap_size=(args.heatmap_size, args.heatmap_size),
@@ -1905,7 +1927,7 @@ def main(args):
 
         if args.train_json_list and args.train_json_list_mode == 'extra':
             train_focus_dataset = PoseEstimationDataset(
-                data_dir=args.data_dir,
+                data_dir=train_data_dirs[0],
                 keypoint_names=keypoint_names,
                 image_size=(args.image_size, args.image_size),
                 heatmap_size=(args.heatmap_size, args.heatmap_size),
@@ -1993,14 +2015,19 @@ def main(args):
     cam_settings_path = None
 
     # Try to find _camera_settings.json in data directory
-    temp_path = Path(args.data_dir) / "_camera_settings.json"
-    if temp_path.exists():
-        cam_settings_path = temp_path
-    else:
-        # If not found in root, search recursively
-        for p in Path(args.data_dir).rglob("_camera_settings.json"):
-            cam_settings_path = p
+    for train_dir in train_data_dirs:
+        temp_path = Path(train_dir) / "_camera_settings.json"
+        if temp_path.exists():
+            cam_settings_path = temp_path
             break
+    if cam_settings_path is None:
+        # If not found in roots, search recursively
+        for train_dir in train_data_dirs:
+            for p in Path(train_dir).rglob("_camera_settings.json"):
+                cam_settings_path = p
+                break
+            if cam_settings_path is not None:
+                break
     
     if cam_settings_path is not None and cam_settings_path.exists():
         try:
@@ -2290,8 +2317,8 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Train DINOv3 Pose Estimation Model')
 
     # Data
-    parser.add_argument('--data-dir', type=str, required=True,
-                        help='Path to training data directory')
+    parser.add_argument('--data-dir', type=str, required=True, nargs='+',
+                        help='Path(s) to training data directory (supports multiple)')
     parser.add_argument('--val-dir', type=str, default=None,
                         help='Path to validation data directory (optional)')
     parser.add_argument('--train-split', type=float, default=0.9,

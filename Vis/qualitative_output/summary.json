@@ -1,324 +1,83 @@
 [
   {
-    "json_path": "/data/public/NAS/DINObotPose2/Dataset/Converted_dataset/DREAM_to_DREAM_syn/panda_synth_test_photo/000001.json",
-    "add_mm": 1092.1314348857957,
-    "add_angle_fk_cam_mm": 127.76098678190903,
+    "json_path": "/data/public/NAS/DINObotPose2/Dataset/Converted_dataset/DREAM_to_DREAM/panda-3cam_azure/000000.json",
+    "add_mm": 1889.5151917220585,
+    "add_angle_fk_cam_mm": 4.5780488714353,
     "pred_2d": [
       [
-        261.25,
-        315.0
+        242.5,
+        398.4375
       ],
       [
-        253.75,
-        245.625
+        237.5,
+        271.875
       ],
       [
-        202.5,
-        182.8125
-      ],
-      [
-        213.75,
-        167.8125
-      ],
-      [
-        307.5,
-        135.9375
-      ],
-      [
-        335.0,
-        134.0625
-      ],
-      [
-        336.25,
-        169.6875
-      ]
-    ],
-    "gt_2d": [
-      [
-        262.4172058105469,
-        314.3193054199219
-      ],
-      [
-        255.6096954345703,
-        245.80450439453125
-      ],
-      [
-        203.0511016845703,
-        179.74949645996094
-      ],
-      [
-        214.70179748535156,
-        166.77529907226562
-      ],
-      [
-        308.2298889160156,
-        135.42050170898438
-      ],
-      [
-        335.1726989746094,
-        133.1278076171875
-      ],
-      [
-        336.497314453125,
-        169.94219970703125
-      ]
-    ],
-    "extrinsic_source": "gt_pnp",
-    "debug": {
-      "fk_gt_align_rms_m": 6.486606975065616e-06,
-      "gt_reproj_mean_px": 0.0014266247123256419,
-      "gt_reproj_median_px": 0.0010193410601289912,
-      "gt_reproj_max_px": 0.0027689310348596886,
-      "num_valid_3d": 7,
-      "num_valid_2d": 7,
-      "per_keypoint_residuals": [
-        {
-          "name": "panda_link0",
-          "valid_3d": true,
-          "valid_2d": true,
-          "residual_3d_m": 9.967046813502188e-06,
-          "residual_2d_px": 0.002056569470652919
-        },
-        {
-          "name": "panda_link2",
-          "valid_3d": true,
-          "valid_2d": true,
-          "residual_3d_m": 5.787210383173349e-06,
-          "residual_2d_px": 0.0007844746918393488
-        },
-        {
-          "name": "panda_link3",
-          "valid_3d": true,
-          "valid_2d": true,
-          "residual_3d_m": 3.258636439890196e-06,
-          "residual_2d_px": 0.0008145736793495482
-        },
-        {
-          "name": "panda_link4",
-          "valid_3d": true,
-          "valid_2d": true,
-          "residual_3d_m": 3.851139415029635e-06,
-          "residual_2d_px": 0.0010193410601289912
-        },
-        {
-          "name": "panda_link6",
-          "valid_3d": true,
-          "valid_2d": true,
-          "residual_3d_m": 2.101841096433488e-06,
-          "residual_2d_px": 0.0004258703729381652
-        },
-        {
-          "name": "panda_link7",
-          "valid_3d": true,
-          "valid_2d": true,
-          "residual_3d_m": 6.497096249243378e-06,
-          "residual_2d_px": 0.002116612676510833
-        },
-        {
-          "name": "panda_hand",
-          "valid_3d": true,
-          "valid_2d": true,
-          "residual_3d_m": 9.466714437077502e-06,
-          "residual_2d_px": 0.0027689310348596886
-        }
-      ]
-    }
-  },
-  {
-    "json_path": "/data/public/NAS/DINObotPose2/Dataset/Converted_dataset/DREAM_to_DREAM_syn/panda_synth_test_photo/000638.json",
-    "add_mm": 935.3449029330108,
-    "add_angle_fk_cam_mm": 146.20234310038617,
-    "pred_2d": [
-      [
-        245.0,
-        335.625
-      ],
-      [
-        231.25,
-        245.625
-      ],
-      [
-        271.25,
-        142.5
-      ],
-      [
-        303.75,
-        159.375
-      ],
-      [
-        362.5,
-        294.375
-      ],
-      [
-        380.0,
-        286.875
-      ],
-      [
-        378.75,
-        318.75
-      ]
-    ],
-    "gt_2d": [
-      [
-        244.47149658203125,
-        336.4670104980469
-      ],
-      [
-        231.5177001953125,
-        244.78219604492188
-      ],
-      [
-        272.9458923339844,
-        141.28250122070312
-      ],
-      [
-        305.35430908203125,
-        159.37730407714844
-      ],
-      [
-        361.605712890625,
-        295.6741943359375
-      ],
-      [
-        382.04119873046875,
-        286.00201416015625
-      ],
-      [
-        380.0696105957031,
-        318.37188720703125
-      ]
-    ],
-    "extrinsic_source": "gt_pnp",
-    "debug": {
-      "fk_gt_align_rms_m": 1.0033028425236007e-05,
-      "gt_reproj_mean_px": 0.0029493618463645203,
-      "gt_reproj_median_px": 0.0024966113477422943,
-      "gt_reproj_max_px": 0.005443292199102154,
-      "num_valid_3d": 7,
-      "num_valid_2d": 7,
-      "per_keypoint_residuals": [
-        {
-          "name": "panda_link0",
-          "valid_3d": true,
-          "valid_2d": true,
-          "residual_3d_m": 1.856239268367305e-05,
-          "residual_2d_px": 0.005443292199102154
-        },
-        {
-          "name": "panda_link2",
-          "valid_3d": true,
-          "valid_2d": true,
-          "residual_3d_m": 7.176618160237469e-06,
-          "residual_2d_px": 0.0024966113477422943
-        },
-        {
-          "name": "panda_link3",
-          "valid_3d": true,
-          "valid_2d": true,
-          "residual_3d_m": 3.237763790793499e-06,
-          "residual_2d_px": 0.0011057044273715504
-        },
-        {
-          "name": "panda_link4",
-          "valid_3d": true,
-          "valid_2d": true,
-          "residual_3d_m": 4.504417711051129e-06,
-          "residual_2d_px": 0.001602158987774037
-        },
-        {
-          "name": "panda_link6",
-          "valid_3d": true,
-          "valid_2d": true,
-          "residual_3d_m": 8.74371815943923e-06,
-          "residual_2d_px": 0.0032410818121956695
-        },
-        {
-          "name": "panda_link7",
-          "valid_3d": true,
-          "valid_2d": true,
-          "residual_3d_m": 6.7571721959710414e-06,
-          "residual_2d_px": 0.0024633793225816974
-        },
-        {
-          "name": "panda_hand",
-          "valid_3d": true,
-          "valid_2d": true,
-          "residual_3d_m": 1.2477197950345698e-05,
-          "residual_2d_px": 0.004293304827784238
-        }
-      ]
-    }
-  },
-  {
-    "json_path": "/data/public/NAS/DINObotPose2/Dataset/Converted_dataset/DREAM_to_DREAM_syn/panda_synth_test_photo/001000.json",
-    "add_mm": 1217.327833859279,
-    "add_angle_fk_cam_mm": 326.193644722449,
-    "pred_2d": [
-      [
-        382.5,
-        314.0625
-      ],
-      [
-        397.5,
-        260.625
-      ],
-      [
-        408.75,
+        158.75,
         193.125
       ],
       [
-        402.5,
-        208.125
+        172.5,
+        165.9375
       ],
       [
-        370.0,
-        302.8125
+        292.5,
+        180.9375
       ],
       [
-        372.5,
-        315.9375
+        331.25,
+        176.25
       ],
       [
-        351.25,
-        312.1875
+        335.0,
+        229.6875
       ]
+    ],
+    "pred_kp_conf": [
+      0.6978645920753479,
+      0.7120648622512817,
+      0.7022132873535156,
+      0.7121798992156982,
+      0.7280386090278625,
+      0.723098635673523,
+      0.721508264541626
     ],
     "gt_2d": [
       [
-        382.918701171875,
-        314.180908203125
+        244.4055149160484,
+        395.85813561721443
       ],
       [
-        396.68548583984375,
-        260.3782043457031
+        239.97563862860844,
+        272.5516794843052
       ],
       [
-        410.4435119628906,
-        195.131103515625
+        165.01636102813399,
+        195.098419859186
       ],
       [
-        402.29669189453125,
-        208.06610107421875
+        173.3746934322235,
+        169.7490076880204
       ],
       [
-        369.4020080566406,
-        297.618408203125
+        294.92278196831313,
+        180.62773008937563
       ],
       [
-        362.5979919433594,
-        318.34051513671875
+        330.98764469529624,
+        177.2048759919866
       ],
       [
-        348.656005859375,
-        311.65301513671875
+        335.13896618064496,
+        231.07889180863083
       ]
     ],
     "extrinsic_source": "gt_pnp",
     "debug": {
-      "fk_gt_align_rms_m": 3.233476632853139e-06,
-      "gt_reproj_mean_px": 0.0006357246198847474,
-      "gt_reproj_median_px": 0.0006484829854918248,
-      "gt_reproj_max_px": 0.0011308803933499066,
+      "fk_gt_align_rms_m": 1.993839506182992e-08,
+      "gt_reproj_mean_px": 6.804594887458459e-06,
+      "gt_reproj_median_px": 8.08309506169932e-06,
+      "gt_reproj_max_px": 1.1217535045415436e-05,
       "num_valid_3d": 7,
       "num_valid_2d": 7,
       "per_keypoint_residuals": [
@@ -326,50 +85,318 @@
           "name": "panda_link0",
           "valid_3d": true,
           "valid_2d": true,
-          "residual_3d_m": 5.213334276238756e-06,
-          "residual_2d_px": 0.0011308803933499066
+          "residual_3d_m": 2.688423742123824e-08,
+          "residual_2d_px": 8.08309506169932e-06
         },
         {
           "name": "panda_link2",
           "valid_3d": true,
           "valid_2d": true,
-          "residual_3d_m": 3.811078429159243e-06,
-          "residual_2d_px": 0.0006484829854918248
+          "residual_3d_m": 1.5294864906051442e-08,
+          "residual_2d_px": 4.376479363031874e-06
         },
         {
           "name": "panda_link3",
           "valid_3d": true,
           "valid_2d": true,
-          "residual_3d_m": 1.1925411779281262e-06,
-          "residual_2d_px": 0.0002916686364802454
+          "residual_3d_m": 1.1033692676980094e-08,
+          "residual_2d_px": 3.843303992352337e-06
         },
         {
           "name": "panda_link4",
           "valid_3d": true,
           "valid_2d": true,
-          "residual_3d_m": 1.5861560173606164e-06,
-          "residual_2d_px": 0.0004856999774866076
+          "residual_3d_m": 2.659231593232146e-08,
+          "residual_2d_px": 1.0215332896728058e-05
         },
         {
           "name": "panda_link6",
           "valid_3d": true,
           "valid_2d": true,
-          "residual_3d_m": 4.1862226958267614e-06,
-          "residual_2d_px": 0.0007443910529041487
+          "residual_3d_m": 1.874747652186312e-08,
+          "residual_2d_px": 8.592497561575154e-06
         },
         {
           "name": "panda_link7",
           "valid_3d": true,
           "valid_2d": true,
-          "residual_3d_m": 2.09507458168444e-06,
-          "residual_2d_px": 0.00043101401485604295
+          "residual_3d_m": 2.6447434217090445e-09,
+          "residual_2d_px": 1.3039202914070363e-06
         },
         {
           "name": "panda_hand",
           "valid_3d": true,
           "valid_2d": true,
-          "residual_3d_m": 2.3733060365455113e-06,
-          "residual_2d_px": 0.0007179352786244557
+          "residual_3d_m": 2.5273026823798363e-08,
+          "residual_2d_px": 1.1217535045415436e-05
+        }
+      ]
+    }
+  },
+  {
+    "json_path": "/data/public/NAS/DINObotPose2/Dataset/Converted_dataset/DREAM_to_DREAM/panda-3cam_azure/000777.json",
+    "add_mm": 1694.8612800148112,
+    "add_angle_fk_cam_mm": 13.839499365538234,
+    "pred_2d": [
+      [
+        243.75,
+        398.4375
+      ],
+      [
+        237.5,
+        270.9375
+      ],
+      [
+        161.25,
+        172.5
+      ],
+      [
+        176.25,
+        149.0625
+      ],
+      [
+        317.5,
+        185.625
+      ],
+      [
+        358.75,
+        171.5625
+      ],
+      [
+        370.0,
+        228.75
+      ]
+    ],
+    "pred_kp_conf": [
+      0.6859687566757202,
+      0.7176529765129089,
+      0.6964080929756165,
+      0.7108504772186279,
+      0.7182559967041016,
+      0.7274646759033203,
+      0.7124134302139282
+    ],
+    "gt_2d": [
+      [
+        244.4055149160484,
+        395.85813561721443
+      ],
+      [
+        239.97563862860844,
+        272.5516794843052
+      ],
+      [
+        166.08312173805788,
+        172.33925798654505
+      ],
+      [
+        179.06545847159947,
+        150.7603858312959
+      ],
+      [
+        318.82723210880715,
+        185.4101802857664
+      ],
+      [
+        360.26622889441535,
+        173.55010658008564
+      ],
+      [
+        372.18344268705465,
+        229.7163342504706
+      ]
+    ],
+    "extrinsic_source": "gt_pnp",
+    "debug": {
+      "fk_gt_align_rms_m": 1.4488763317511566e-08,
+      "gt_reproj_mean_px": 5.309484132254377e-06,
+      "gt_reproj_median_px": 4.778868078616051e-06,
+      "gt_reproj_max_px": 1.12371886579794e-05,
+      "num_valid_3d": 7,
+      "num_valid_2d": 7,
+      "per_keypoint_residuals": [
+        {
+          "name": "panda_link0",
+          "valid_3d": true,
+          "valid_2d": true,
+          "residual_3d_m": 8.02472124840579e-09,
+          "residual_2d_px": 3.142634342512627e-06
+        },
+        {
+          "name": "panda_link2",
+          "valid_3d": true,
+          "valid_2d": true,
+          "residual_3d_m": 1.206568034175111e-08,
+          "residual_2d_px": 4.778868078616051e-06
+        },
+        {
+          "name": "panda_link3",
+          "valid_3d": true,
+          "valid_2d": true,
+          "residual_3d_m": 2.014580418200879e-08,
+          "residual_2d_px": 5.365249359388891e-06
+        },
+        {
+          "name": "panda_link4",
+          "valid_3d": true,
+          "valid_2d": true,
+          "residual_3d_m": 9.040720328643872e-09,
+          "residual_2d_px": 2.3807646182342973e-06
+        },
+        {
+          "name": "panda_link6",
+          "valid_3d": true,
+          "valid_2d": true,
+          "residual_3d_m": 5.8461878437963805e-09,
+          "residual_2d_px": 2.539136590135756e-06
+        },
+        {
+          "name": "panda_link7",
+          "valid_3d": true,
+          "valid_2d": true,
+          "residual_3d_m": 2.2928191557560715e-08,
+          "residual_2d_px": 1.12371886579794e-05
+        },
+        {
+          "name": "panda_hand",
+          "valid_3d": true,
+          "valid_2d": true,
+          "residual_3d_m": 1.4561082152999426e-08,
+          "residual_2d_px": 7.722547278913609e-06
+        }
+      ]
+    }
+  },
+  {
+    "json_path": "/data/public/NAS/DINObotPose2/Dataset/Converted_dataset/DREAM_to_DREAM/panda-3cam_azure/001777.json",
+    "add_mm": 1638.991432213446,
+    "add_angle_fk_cam_mm": 14.351683975672945,
+    "pred_2d": [
+      [
+        243.75,
+        399.375
+      ],
+      [
+        240.0,
+        271.875
+      ],
+      [
+        220.0,
+        137.8125
+      ],
+      [
+        256.25,
+        135.9375
+      ],
+      [
+        396.25,
+        151.875
+      ],
+      [
+        415.0,
+        130.3125
+      ],
+      [
+        441.25,
+        158.4375
+      ]
+    ],
+    "pred_kp_conf": [
+      0.6570841670036316,
+      0.7159074544906616,
+      0.71197909116745,
+      0.723433256149292,
+      0.7220779657363892,
+      0.7156743407249451,
+      0.7239294648170471
+    ],
+    "gt_2d": [
+      [
+        244.4055149160484,
+        395.85813561721443
+      ],
+      [
+        239.97563862860844,
+        272.5516794843052
+      ],
+      [
+        220.5852752959377,
+        141.12821373447912
+      ],
+      [
+        255.43817942314666,
+        138.55091627596443
+      ],
+      [
+        396.96685150122045,
+        152.63969842830272
+      ],
+      [
+        412.8553999020198,
+        131.58429283615877
+      ],
+      [
+        437.14009478249324,
+        158.41900219993838
+      ]
+    ],
+    "extrinsic_source": "gt_pnp",
+    "debug": {
+      "fk_gt_align_rms_m": 4.69971540376839e-08,
+      "gt_reproj_mean_px": 1.5415293826581427e-05,
+      "gt_reproj_median_px": 1.6198114433831727e-05,
+      "gt_reproj_max_px": 3.0435329037659626e-05,
+      "num_valid_3d": 7,
+      "num_valid_2d": 7,
+      "per_keypoint_residuals": [
+        {
+          "name": "panda_link0",
+          "valid_3d": true,
+          "valid_2d": true,
+          "residual_3d_m": 7.490735836900314e-08,
+          "residual_2d_px": 3.0435329037659626e-05
+        },
+        {
+          "name": "panda_link2",
+          "valid_3d": true,
+          "valid_2d": true,
+          "residual_3d_m": 4.4530901465528734e-08,
+          "residual_2d_px": 1.8369623481902513e-05
+        },
+        {
+          "name": "panda_link3",
+          "valid_3d": true,
+          "valid_2d": true,
+          "residual_3d_m": 2.4718438270935453e-08,
+          "residual_2d_px": 1.0939537251059697e-05
+        },
+        {
+          "name": "panda_link4",
+          "valid_3d": true,
+          "valid_2d": true,
+          "residual_3d_m": 7.985082423670064e-09,
+          "residual_2d_px": 3.3030886170715708e-06
+        },
+        {
+          "name": "panda_link6",
+          "valid_3d": true,
+          "valid_2d": true,
+          "residual_3d_m": 2.6087845981249303e-08,
+          "residual_2d_px": 9.731583489067097e-06
+        },
+        {
+          "name": "panda_link7",
+          "valid_3d": true,
+          "valid_2d": true,
+          "residual_3d_m": 5.3911264967876885e-08,
+          "residual_2d_px": 1.8929780475477752e-05
+        },
+        {
+          "name": "panda_hand",
+          "valid_3d": true,
+          "valid_2d": true,
+          "residual_3d_m": 6.004374205604408e-08,
+          "residual_2d_px": 1.6198114433831727e-05
         }
       ]
     }
